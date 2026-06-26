@@ -22,6 +22,9 @@ server.on("connection", (ws, req) => {
   const participant = pathParts[3]; // Assuming the path is /websocket/participant1
   console.log(`mode: ${mode} participant: ${participant}`);
 
+  const researcher = "default_researcher" //changed when adding the IAM
+  const study = "default_study" //changed when adding the IAM
+
   let hasMainRecordingStarted = false;
 
   if (!participant) {
@@ -31,12 +34,20 @@ server.on("connection", (ws, req) => {
   }
 
   const startTime = Math.floor(new Date().getTime() / 1000);
-  const fileName = `${participant}-${startTime}-Recording.csv`;
-  const filePath = path.join(RECORDINGS_DIR, fileName);
+  //creating new directory for the files
+  const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
+
+  // ensure directory for recordings exists
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
+  }
+
+  const fileName = `Recording.csv`;
+  const filePath = path.join(sessionDir, fileName);
   const writeStream = fs.createWriteStream(filePath);
 
-  const deviceSetupFileName = `${participant}-${startTime}-Setup.csv`;
-  const deviceSetupFilePath = path.join(RECORDINGS_DIR, deviceSetupFileName);
+  const deviceSetupFileName = `Setup.csv`;
+  const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
   const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
 
   if (mode === "daisy") {
