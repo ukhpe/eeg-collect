@@ -33,6 +33,19 @@ server.on("connection", (ws, req) => {
     return;
   }
 
+  // watchdog (if hardware unexpectedly stops sending data)
+  let watchdogTimer;
+  const resetWatchdog = () => {
+    if (watchdogTimer) clearTimeout(watchdogTimer);
+    watchdogTimer = setTimeout(() => {
+      console.error(`!!! TIMEOUT: Keine Daten von Participant ${participant} seit 3 Sekunden.`);
+      logError("Data stream timeout", new Error("Hardware stopped sending data"));
+      /*ws.terminate(); maybe needed if there are problems with reconnecting (while short testing no issues)
+      when just the headset is turned off after turning them on again they just reconnect if the dongle is pulled
+      one hast to refresh the frontend because there will also be the error displayed*/
+    }, 3000);
+  };
+
   const startTime = Math.floor(new Date().getTime() / 1000);
   //creating new directory for the files
   const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
@@ -49,6 +62,25 @@ server.on("connection", (ws, req) => {
   const deviceSetupFileName = `Setup.csv`;
   const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
   const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
+
+  //central logging-function
+  const logError = (contextMessage, error) => {
+    const timestamp = new Date().toISOString();
+    const errorDetails = error instanceof Error ? error.stack : error;
+
+    const logMessage = `[${timestamp}] [MODE: ${mode}] ERROR: ${contextMessage}\nDetails: ${errorDetails}\n------------------------------------------\n`;
+
+    //live feedback in terminal
+    console.error(`!!! ERROR [Participant: ${participant}]: ${contextMessage}`, error);
+
+    //logging of error in a file
+    const logFilePath = path.join(sessionDir, "session_error.log");
+    fs.appendFile(logFilePath, logMessage, (fsErr) => {
+      if (fsErr) {
+        console.error("critical system error: error log file couldn't be written!", fsErr);
+      }
+    });
+  };
 
   if (mode === "daisy") {
     // Write the CSV header
@@ -71,87 +103,100 @@ server.on("connection", (ws, req) => {
   let previousData = null;
 
   ws.on("message", (message) => {
-    if (message.toString() === "heartbeat") {
-      return;
-    }
+    try {
+      resetWatchdog();
 
-    if (message.toString() === "Audio File Started") {
-      index += 1;
-      const datetime = new Date().toLocaleString();
-      const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Started\n`;
-
-      !hasMainRecordingStarted
-        ? setupWriteStream.write(csvRow)
-        : writeStream.write(csvRow);
-
-      console.log("Audio File Started");
-      return;
-    }
-
-    if (message.toString() === "Audio File Ended") {
-      index += 1;
-      const datetime = new Date().toLocaleString();
-      const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Ended\n`;
-
-      !hasMainRecordingStarted
-        ? setupWriteStream.write(csvRow)
-        : writeStream.write(csvRow);
-
-      console.log("Audio File Ended");
-      return;
-    }
-
-    if (message.toString() === "Setup Finished") {
-      hasMainRecordingStarted = true;
-      return;
-    }
-
-    let data;
-    if (mode === "daisy") {
-      data = decodeDaisyData(message);
-      if (data) {
-        if (data.sampleNumber % 2 === 0) {
-          // Combine with previous odd sample
-          if (
-            previousData &&
-            previousData.sampleNumber === data.sampleNumber - 1
-          ) {
-            const combinedData = {
-              ...previousData,
-              ...data,
-            };
-            index += 1;
-            const datetime = new Date(combinedData.timestamp).toLocaleString();
-            const csvRow = `${index};${datetime};${combinedData.sampleNumber};${combinedData.timestamp};${combinedData.A1};${combinedData.A2};${combinedData.A3};${combinedData.A4};${combinedData.A5};${combinedData.A6};${combinedData.A7};${combinedData.A8};${combinedData.A9};${combinedData.A10};${combinedData.A11};${combinedData.A12};${combinedData.A13};${combinedData.A14};${combinedData.A15};${combinedData.A16};${combinedData.Accel0};${combinedData.Accel1};${combinedData.Accel2}\n`;
-            writeStream.write(csvRow);
-            previousData = null; // Reset for next pair
-          }
-        } else {
-          // Store odd sample data
-          previousData = data;
-        }
-      }
-    } else if (mode === "cyton") {
-      data = decodeCytonData(message);
-
-      if (!data) {
+      if (message.toString() === "heartbeat") {
         return;
       }
 
-      index += 1;
-      const datetime = new Date(data.timestamp).toLocaleString();
-      const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+      if (message.toString() === "Audio File Started") {
+        index += 1;
+        const datetime = new Date().toLocaleString();
+        const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Started\n`;
 
-      hasMainRecordingStarted
-        ? writeStream.write(csvRow)
-        : setupWriteStream.write(csvRow);
-    } else {
-      // Store odd sample data
-      previousData = data;
+        !hasMainRecordingStarted
+            ? setupWriteStream.write(csvRow)
+            : writeStream.write(csvRow);
+
+        console.log("Audio File Started");
+        return;
+      }
+
+      if (message.toString() === "Audio File Ended") {
+        index += 1;
+        const datetime = new Date().toLocaleString();
+        const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Ended\n`;
+
+        !hasMainRecordingStarted
+            ? setupWriteStream.write(csvRow)
+            : writeStream.write(csvRow);
+
+        console.log("Audio File Ended");
+        return;
+      }
+
+      if (message.toString() === "Setup Finished") {
+        hasMainRecordingStarted = true;
+        return;
+      }
+
+      let data;
+      if (mode === "daisy") {
+        data = decodeDaisyData(message);
+        if (data) {
+          if (data.sampleNumber % 2 === 0) {
+            // Combine with previous odd sample
+            if (
+                previousData &&
+                previousData.sampleNumber === data.sampleNumber - 1
+            ) {
+              const combinedData = {
+                ...previousData,
+                ...data,
+              };
+              index += 1;
+              const datetime = new Date(combinedData.timestamp).toLocaleString();
+              const csvRow = `${index};${datetime};${combinedData.sampleNumber};${combinedData.timestamp};${combinedData.A1};${combinedData.A2};${combinedData.A3};${combinedData.A4};${combinedData.A5};${combinedData.A6};${combinedData.A7};${combinedData.A8};${combinedData.A9};${combinedData.A10};${combinedData.A11};${combinedData.A12};${combinedData.A13};${combinedData.A14};${combinedData.A15};${combinedData.A16};${combinedData.Accel0};${combinedData.Accel1};${combinedData.Accel2}\n`;
+              writeStream.write(csvRow);
+              previousData = null; // Reset for next pair
+            }
+          } else {
+            // Store odd sample data
+            previousData = data;
+          }
+        }
+      } else if (mode === "cyton") {
+        data = decodeCytonData(message);
+
+        if (!data) {
+          return;
+        }
+
+        index += 1;
+        const datetime = new Date(data.timestamp).toLocaleString();
+        const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+
+        hasMainRecordingStarted
+            ? writeStream.write(csvRow)
+            : setupWriteStream.write(csvRow);
+      } else {
+        // Store odd sample data
+        previousData = data;
+      }
+    } catch (globalMsgError) {
+      // catches unexpected critical errors
+      logError("critical runtime error during stream-data-process", globalMsgError);
     }
   });
 
+  // Security from unexpected loss of connection
+  ws.on("error", (wsError) => {
+    logError("WebSocket connection-error occurred", wsError);
+  });
+
   ws.on("close", () => {
+    if (watchdogTimer) clearTimeout(watchdogTimer); // stop timer if connection is closed normaly
     writeStream.end();
     console.log(`WebSocket connection closed for participant: ${participant}`);
   });
