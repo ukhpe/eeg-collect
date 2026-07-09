@@ -2,6 +2,7 @@ const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
+const http = require("http");
 
 const port = process.env.PORT || 3000;
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
@@ -11,14 +12,89 @@ if (!fs.existsSync(RECORDINGS_DIR)) {
   fs.mkdirSync(RECORDINGS_DIR);
 }
 
-// Create WebSocket server
-const server = new WebSocket.Server({ port });
+
+let currentSessionDirGlobal = null;
+let currentModeGlobal = "unknown";
+
+/**
+ * central log-function
+ * writes errors and warnings in file
+ */
+const writeLog = (level, contextMessage, errorDetails = "") => {
+  const timestamp = new Date().toISOString();
+  const logMessage = `[${timestamp}] [${level.toUpperCase()}] [MODE: ${currentModeGlobal}] ${contextMessage}\nDetails: ${errorDetails}\n------------------------------------------\n`;
+
+  // live feedback in server terminal
+  console.log(`[${level.toUpperCase()}] ${contextMessage}`, errorDetails ? `\nDetails: ${errorDetails}` : "");
+
+  // if no session is started yet the error will be written in global file
+  const targetDir = currentSessionDirGlobal || RECORDINGS_DIR;
+  const logFilePath = path.join(targetDir, "session_error.log");
+
+  fs.appendFile(logFilePath, logMessage, (fsErr) => {
+    if (fsErr) {
+      console.error("critical system error: logfile couldn't be written to !", fsErr);
+    }
+  });
+};
+
+// new http server to get the logs from frontend
+const httpServer = http.createServer(
+    (req, res) => {
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // catch preflight request from browser
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // api endpoint for main.ts
+  if (req.url === "/api/frontend-log" && req.method === "POST") {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", () => {
+      try {
+        const logData = JSON.parse(body);
+
+        writeLog(
+          logData.level || "ERROR",
+          logData.message || "frontend report without message",
+          logData.details || ""
+        );
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Invalid JSON");
+      }
+    });
+  } else {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not Found");
+  }
+});
+
+
+
+// Create WebSocket server with http server
+const server = new WebSocket.Server({ server: httpServer });
 
 server.on("connection", (ws, req) => {
   console.log("WebSocket connection established");
   const location = url.parse(req.url, true);
   const pathParts = location.pathname.split("/");
   const mode = pathParts[2];
+  currentModeGlobal = mode;
   const participant = pathParts[3]; // Assuming the path is /websocket/participant1
   console.log(`mode: ${mode} participant: ${participant}`);
 
@@ -29,26 +105,16 @@ server.on("connection", (ws, req) => {
 
   if (!participant) {
     console.error("Invalid participant identifier");
+    writeLog("ERROR", "Invalid participant identifier", "");
     ws.close();
     return;
   }
 
-  // watchdog (if hardware unexpectedly stops sending data)
-  let watchdogTimer;
-  const resetWatchdog = () => {
-    if (watchdogTimer) clearTimeout(watchdogTimer);
-    watchdogTimer = setTimeout(() => {
-      console.error(`!!! TIMEOUT: Keine Daten von Participant ${participant} seit 3 Sekunden.`);
-      logError("Data stream timeout", new Error("Hardware stopped sending data"));
-      /*ws.terminate(); maybe needed if there are problems with reconnecting (while short testing no issues)
-      when just the headset is turned off after turning them on again they just reconnect if the dongle is pulled
-      one hast to refresh the frontend because there will also be the error displayed*/
-    }, 3000);
-  };
-
   const startTime = Math.floor(new Date().getTime() / 1000);
   //creating new directory for the files
   const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
+
+  currentSessionDirGlobal = sessionDir;
 
   // ensure directory for recordings exists
   if (!fs.existsSync(sessionDir)) {
@@ -63,24 +129,6 @@ server.on("connection", (ws, req) => {
   const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
   const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
 
-  //central logging-function
-  const logError = (contextMessage, error) => {
-    const timestamp = new Date().toISOString();
-    const errorDetails = error instanceof Error ? error.stack : error;
-
-    const logMessage = `[${timestamp}] [MODE: ${mode}] ERROR: ${contextMessage}\nDetails: ${errorDetails}\n------------------------------------------\n`;
-
-    //live feedback in terminal
-    console.error(`!!! ERROR [Participant: ${participant}]: ${contextMessage}`, error);
-
-    //logging of error in a file
-    const logFilePath = path.join(sessionDir, "session_error.log");
-    fs.appendFile(logFilePath, logMessage, (fsErr) => {
-      if (fsErr) {
-        console.error("critical system error: error log file couldn't be written!", fsErr);
-      }
-    });
-  };
 
   if (mode === "daisy") {
     // Write the CSV header
@@ -104,8 +152,6 @@ server.on("connection", (ws, req) => {
 
   ws.on("message", (message) => {
     try {
-      resetWatchdog();
-
       if (message.toString() === "heartbeat") {
         return;
       }
@@ -186,17 +232,16 @@ server.on("connection", (ws, req) => {
       }
     } catch (globalMsgError) {
       // catches unexpected critical errors
-      logError("critical runtime error during stream-data-process", globalMsgError);
+      writeLog("ERROR", "critical runtime error during stream-data-process", globalMsgError);
     }
   });
 
   // Security from unexpected loss of connection
   ws.on("error", (wsError) => {
-    logError("WebSocket connection-error occurred", wsError);
+    writeLog("ERROR", "WebSocket connection-error occurred", wsError);
   });
 
   ws.on("close", () => {
-    if (watchdogTimer) clearTimeout(watchdogTimer); // stop timer if connection is closed normaly
     writeStream.end();
     console.log(`WebSocket connection closed for participant: ${participant}`);
   });
@@ -260,6 +305,8 @@ server.on("connection", (ws, req) => {
   };
 });
 
+
+
 function interpret24bitAsInt32(byteArray) {
   if (byteArray.length !== 3) {
     throw new Error("Byte array must have exactly 3 elements");
@@ -291,4 +338,8 @@ function interpret16bitAsInt32(byteArray) {
   return newInt;
 }
 
-console.log(`WebSocket server is running on ws://localhost:${port}`);
+// start combined websocket and http server
+httpServer.listen(port, () => {
+  console.log(`Server is running on http://localhost:${port} (WebSocket + HTTP Log API)`);
+});
+
