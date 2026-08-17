@@ -2,7 +2,6 @@ const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
-const http = require("http");
 
 const port = process.env.PORT || 3000;
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
@@ -13,22 +12,18 @@ if (!fs.existsSync(RECORDINGS_DIR)) {
 }
 
 
-let currentSessionDirGlobal = null;
-let currentModeGlobal = "unknown";
-
 /**
  * central log-function
  * writes errors and warnings in file
  */
-const writeLog = (level, contextMessage, errorDetails = "") => {
+const writeLog = (targetDir, mode, level, contextMessage, errorDetails = "") => {
   const timestamp = new Date().toISOString();
-  const logMessage = `[${timestamp}] [${level.toUpperCase()}] [MODE: ${currentModeGlobal}] ${contextMessage}\nDetails: ${errorDetails}\n------------------------------------------\n`;
+  const logMessage = `[${timestamp}] [${level.toUpperCase()}] [MODE: ${mode}] ${contextMessage}\nDetails: ${errorDetails}\n------------------------------------------\n`;
 
   // live feedback in server terminal
   console.log(`[${level.toUpperCase()}] ${contextMessage}`, errorDetails ? `\nDetails: ${errorDetails}` : "");
 
-  // if no session is started yet the error will be written in global file
-  const targetDir = currentSessionDirGlobal || RECORDINGS_DIR;
+
   const logFilePath = path.join(targetDir, "session_error.log");
 
   fs.appendFile(logFilePath, logMessage, (fsErr) => {
@@ -38,63 +33,15 @@ const writeLog = (level, contextMessage, errorDetails = "") => {
   });
 };
 
-// new http server to get the logs from frontend
-const httpServer = http.createServer(
-    (req, res) => {
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  // catch preflight request from browser
-  if (req.method === "OPTIONS") {
-    res.writeHead(200);
-    res.end();
-    return;
-  }
-
-  // api endpoint for main.ts
-  if (req.url === "/api/frontend-log" && req.method === "POST") {
-    let body = "";
-
-    req.on("data", (chunk) => {
-      body += chunk.toString();
-    });
-
-    req.on("end", () => {
-      try {
-        const logData = JSON.parse(body);
-
-        writeLog(
-          logData.level || "ERROR",
-          logData.message || "frontend report without message",
-          logData.details || ""
-        );
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success" }));
-      } catch (err) {
-        res.writeHead(400, { "Content-Type": "text/plain" });
-        res.end("Invalid JSON");
-      }
-    });
-  } else {
-    res.writeHead(404, { "Content-Type": "text/plain" });
-    res.end("Not Found");
-  }
-});
-
-
-
-// Create WebSocket server with http server
-const server = new WebSocket.Server({ server: httpServer });
+// Create WebSocket server
+const server = new WebSocket.Server({ port });
 
 server.on("connection", (ws, req) => {
   console.log("WebSocket connection established");
   const location = url.parse(req.url, true);
   const pathParts = location.pathname.split("/");
   const mode = pathParts[2];
-  currentModeGlobal = mode;
   const participant = pathParts[3]; // Assuming the path is /websocket/participant1
   console.log(`mode: ${mode} participant: ${participant}`);
 
@@ -103,18 +50,11 @@ server.on("connection", (ws, req) => {
 
   let hasMainRecordingStarted = false;
 
-  if (!participant) {
-    console.error("Invalid participant identifier");
-    writeLog("ERROR", "Invalid participant identifier", "");
-    ws.close();
-    return;
-  }
-
   const startTime = Math.floor(new Date().getTime() / 1000);
+
   //creating new directory for the files
   const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
 
-  currentSessionDirGlobal = sessionDir;
 
   // ensure directory for recordings exists
   if (!fs.existsSync(sessionDir)) {
@@ -154,6 +94,22 @@ server.on("connection", (ws, req) => {
     try {
       if (message.toString() === "heartbeat") {
         return;
+      }
+
+      // catch frontend logs
+      if (message.toString().startsWith("{") && message.toString().endsWith("}")) {
+        const parsed = JSON.parse(message);
+
+        if (parsed.event === "frontend_log") {
+          writeLog(
+            sessionDir,
+            mode,
+            parsed.level.toUpperCase(),
+            `[Frontend] ${parsed.message}`,
+            parsed.details
+          );
+          return;
+        }
       }
 
       if (message.toString() === "Audio File Started") {
@@ -232,13 +188,13 @@ server.on("connection", (ws, req) => {
       }
     } catch (globalMsgError) {
       // catches unexpected critical errors
-      writeLog("ERROR", "critical runtime error during stream-data-process", globalMsgError);
+      writeLog(sessionDir, mode, "ERROR", "critical runtime error during stream-data-process", globalMsgError);
     }
   });
 
   // Security from unexpected loss of connection
   ws.on("error", (wsError) => {
-    writeLog("ERROR", "WebSocket connection-error occurred", wsError);
+    writeLog(sessionDir, mode, "ERROR", "WebSocket connection-error occurred", wsError);
   });
 
   ws.on("close", () => {
@@ -338,8 +294,4 @@ function interpret16bitAsInt32(byteArray) {
   return newInt;
 }
 
-// start combined websocket and http server
-httpServer.listen(port, () => {
-  console.log(`Server is running on http://localhost:${port} (WebSocket + HTTP Log API)`);
-});
-
+ console.log(`Server is running on http://localhost:${port}`);
