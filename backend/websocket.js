@@ -236,6 +236,7 @@ server.on("connection", (ws, req) => {
   };
 
   const decodeCytonData = (message) => {
+    /*
     const str = message.toString();
     const numbers = str.split(",").map(Number);
 
@@ -255,6 +256,39 @@ server.on("connection", (ws, req) => {
         interpret24bitAsInt32(byteArray.slice(i - 1, i + 2)) * 0.0223517445;
       const channelName = `A${Math.ceil((i - 1) / 3)}`;
       data[channelName] = channelData;
+    }
+     */
+
+    // 1. Nachrichten-Puffer direkt als Buffer/Uint8Array nehmen (ohne toString / split)
+    const chunk = Buffer.isBuffer(message) ? message : Buffer.from(message);
+
+    // Sicherstellen, dass es wirklich ein volles 33-Byte Cyton-Paket ist
+    if (chunk.length !== 33) {
+      console.warn(`Ungültige Paketlänge empfangen: ${chunk.length} Bytes (erwartet: 33)`);
+      return null;
+    }
+
+    // 2. Sample-Nummer liegt bei Cyton an Index 1
+    const sampleNumber = chunk[1];
+
+    // 3. Dekodieren der Werte direkt aus dem Byte-Buffer:
+    // (Cyton-Struktur: Index 0 = Header 0xA0, Index 1 = SampleNum, Index 2-25 = EEG, Index 26-31 = Accel)
+    const data = {
+      sampleNumber,
+      timestamp: Date.now(),
+      Accel0: interpret16bitAsInt32(chunk.slice(26, 28)) * 0.000125,
+      Accel1: interpret16bitAsInt32(chunk.slice(28, 30)) * 0.000125,
+      Accel2: interpret16bitAsInt32(chunk.slice(30, 32)) * 0.000125,
+    };
+
+    // 4. Die 8 EEG-Kanäle auslesen (Kanäle 1-8 liegen an Byte-Offset 2 bis 25)
+    // Jeder Kanal besteht aus genau 3 Bytes (24-bit Integer)
+    for (let channel = 0; channel < 8; channel++) {
+      const startByte = 2 + (channel * 3);
+      const channelBytes = chunk.slice(startByte, startByte + 3);
+
+      const channelData = interpret24bitAsInt32(channelBytes) * 0.0223517445;
+      data[`A${channel + 1}`] = channelData;
     }
 
     return data;
