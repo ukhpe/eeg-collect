@@ -169,7 +169,8 @@ export const useOpenBCIUtils = () => {
 
   // variable for browser caching
   const currentSessionId = ref<string>("");
-  let dexieBatchBuffer: EegData[] = []; // Buffer to accumulate data for batch insertion into Dexie
+  // Buffer to accumulate data for batch insertion into Dexie
+  let dexieBatchBuffer: EegData[] = [];
 
   // Buffer storing complete cyton chunks.
   const rollingBuffer = ref<OpenBCISerialData[]>([]);
@@ -288,9 +289,6 @@ export const useOpenBCIUtils = () => {
     // new Id for browswer caching
     currentSessionId.value = `${participantId.value}_${getReadableTimestamp()}`;
 
-    //cleanup other sessions in Dexie db
-    await cleanupOtherSessions(currentSessionId.value);
-
     console.log("Setup Finished");
     ws.value.send("Setup Finished");
     await commandBoardStartStreamingData(RecordingMode.SESSION_RECORDING);
@@ -300,7 +298,7 @@ export const useOpenBCIUtils = () => {
 
   const isWhileRunning = ref<boolean>(false);
 
-  // Wie readData() in cyton.js
+  // Like readData() in cyton.js
   const startSignalQualityCheck = async () => {
     isRecording.value = true;
 
@@ -378,6 +376,13 @@ export const useOpenBCIUtils = () => {
               continue;
             }
 
+            // catch incomplete chunks and reset
+            if (chunkBuffer.length != 33) {
+              chunkBuffer = []; // Reset buffer for the next chunk
+              headerFound = false;
+              continue;
+            }
+
             headerFound = false;
 
             if (
@@ -408,24 +413,7 @@ export const useOpenBCIUtils = () => {
                   break;
               }
 
-              /*
-              if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-                logToBackend("error", "WebSocket not open, chunk not sent.");
-                break;
-              }
-
-              try {
-                //@ts-ignore-next-line
-                ws.value.send(chunkBuffer);
-              } catch (err) {
-                logToBackend("error", "Error sending chunk to WebSocket:", err);
-              }
-              */
-              if (chunkBuffer.length != 33) {
-                console.log("vor safe record", chunkBuffer.length);
-              }
-
-              saveChunkToDexie(chunkBuffer);
+              saveChunkToDexie([...chunkBuffer]);
 
             } else if (
               specifiedRecordingMode === RecordingMode.IMPEDANCE ||
@@ -452,21 +440,8 @@ export const useOpenBCIUtils = () => {
 
               switch (mode.value) {
                 case ConnectionMode.CYTON: {
-                  /*
-                  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-                    logToBackend("error", "WebSocket not open, chunk not sent.");
-                    break;
-                  }
 
-                  try {
-                    //@ts-ignore-next-line
-                    ws.value.send(chunkBuffer);
-                  } catch (err) {
-                    logToBackend("error", "Error sending chunk to WebSocket:", err);
-                  }*/
-
-                  console.log("vor safe", chunkBuffer.length);
-                  saveChunkToDexie(chunkBuffer);
+                  saveChunkToDexie([...chunkBuffer]);
 
                   break;
                 }
@@ -711,31 +686,33 @@ export const useOpenBCIUtils = () => {
 
   // ---- METHODS: Internal ----
 
-  // functions to cleanup Dexie db
-  const cleanupOtherSessions = async (sessionIdToKeep: string) => {
+  // clears the Dexie db on start, to avoid old data being sent to backend
+  const clearEEGDataOnStart = async () => {
     try {
-      const deleteSessions = await db.eegData.where('sessionId').notEqual(sessionIdToKeep).delete();
-      console.log('Dexie db cleaned.');
+      await db.eegData.clear();
+      console.log("Dexie-Databank succesfully cleared on start.");
     } catch (error) {
-        logToBackend("error", "Error cleaning up Dexie db:", error);
+      console.error("Error clearing the Dexie database: ", error);
     }
-  }
+  };
 
+  // saves a chunk to Dexie db if the batchbuffer is "full", and triggers sync if buffer is full
   const saveChunkToDexie = (chunk: Uint8Array | number[]) => {
-    console.log(chunk.length);// zum testen ob 33 wie und was
     dexieBatchBuffer.push({
       sessionId: currentSessionId.value || 'pre_session',
       timestamp: Date.now(),
       participantId: participantId.value || "unknown",
-      payload: Array.from(chunk),
+      payload: Array.from(new Uint8Array(chunk)),
     });
 
-    if (dexieBatchBuffer.length >= 1) {
+    if (dexieBatchBuffer.length >= 50) {
       const batchToSave = [...dexieBatchBuffer];
       dexieBatchBuffer = [];
 
       db.eegData.bulkAdd(batchToSave).then(() => {
-        triggerSync();
+        if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+          triggerSync();
+        }
       }).catch((error) => {
         logToBackend("error", "Error saving batch to Dexie db:", error);
       });
@@ -756,15 +733,17 @@ export const useOpenBCIUtils = () => {
 
         if (pendingItems.length === 0) break;
 
-        for (const item of pendingItems) {
-          ws.value.send(new Uint8Array(item.payload));
-          if (item.payload.length != 33) {
-            console.log("payload länge", item.payload.length, "als unit8array", new Uint8Array(item.payload).length, item.payload);
+        const idsToDelete: number[] = [];
 
+        for (const item of pendingItems) {
+
+          if (item.id !== undefined) {
+            idsToDelete.push(item.id);
           }
+
+          ws.value.send(new Uint8Array(item.payload));
         }
 
-        const idsToDelete = pendingItems.map(item => item.id).filter((id): id is number => id !== undefined);
         await db.eegData.bulkDelete(idsToDelete);
       }
     } catch (error) {
@@ -1038,6 +1017,7 @@ export const useOpenBCIUtils = () => {
         getEncodedCytonCommand(CytonBoardCommands.CONFIGURE_SAMPLING_RATE),
       );
       console.log("Recording started");
+      await clearEEGDataOnStart();
       writer.releaseLock();
       isRecording.value = true;
     } catch (error) {

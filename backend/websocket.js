@@ -169,19 +169,41 @@ server.on("connection", (ws, req) => {
           }
         }
       } else if (mode === "cyton") {
-        data = decodeCytonData(message);
 
-        if (!data) {
-          return;
+        let rawBuffer;
+        if (Buffer.isBuffer(message)) {
+          rawBuffer = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+        } else {
+          rawBuffer = new Uint8Array(message);
         }
 
-        index += 1;
-        const datetime = new Date(data.timestamp).toLocaleString();
-        const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+        // Check if the message is a multiple of 33 bytes (e.g., 33, 66, 1650 bytes)
+        if (rawBuffer.length >= 33 && rawBuffer.length % 33 === 0) {
 
-        hasMainRecordingStarted
-            ? writeStream.write(csvRow)
-            : setupWriteStream.write(csvRow);
+          // Loop through all 33-byte blocks in the message
+          for (let offset = 0; offset < rawBuffer.length; offset += 33) {
+
+            // Take a single 33-byte chunk from the raw buffer
+            const singleChunk = rawBuffer.slice(offset, offset + 33);
+
+            // decode the 33-byte chunk with old Cyton decoder
+            data = decodeCytonData(singleChunk);
+
+            // If paket valid -> write to CSV
+            if (data) {
+              index += 1;
+              const datetime = new Date(data.timestamp).toLocaleString();
+              const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+
+              hasMainRecordingStarted
+                ? writeStream.write(csvRow)
+                : setupWriteStream.write(csvRow);
+            }
+          }
+        } else {
+          console.warn(`Received Buffer doesn´t have the correct length, it has (${rawBuffer.length} Bytes)`);
+        }
+
       } else {
         // Store odd sample data
         previousData = data;
@@ -235,12 +257,8 @@ server.on("connection", (ws, req) => {
     return data;
   };
 
-  const decodeCytonData = (message) => {
-    /*
-    const str = message.toString();
-    const numbers = str.split(",").map(Number);
-
-    const chunk = new Uint8Array(numbers);
+  const decodeCytonData = (chunk) => {
+    //small changes to fit with browser caching
     const byteArray = chunk.slice(1, -1);
     const sampleNumber = chunk[1];
     const data = {
@@ -256,39 +274,6 @@ server.on("connection", (ws, req) => {
         interpret24bitAsInt32(byteArray.slice(i - 1, i + 2)) * 0.0223517445;
       const channelName = `A${Math.ceil((i - 1) / 3)}`;
       data[channelName] = channelData;
-    }
-     */
-
-    // 1. Nachrichten-Puffer direkt als Buffer/Uint8Array nehmen (ohne toString / split)
-    const chunk = Buffer.isBuffer(message) ? message : Buffer.from(message);
-
-    // Sicherstellen, dass es wirklich ein volles 33-Byte Cyton-Paket ist
-    if (chunk.length !== 33) {
-      console.warn(`Ungültige Paketlänge empfangen: ${chunk.length} Bytes (erwartet: 33)`);
-      return null;
-    }
-
-    // 2. Sample-Nummer liegt bei Cyton an Index 1
-    const sampleNumber = chunk[1];
-
-    // 3. Dekodieren der Werte direkt aus dem Byte-Buffer:
-    // (Cyton-Struktur: Index 0 = Header 0xA0, Index 1 = SampleNum, Index 2-25 = EEG, Index 26-31 = Accel)
-    const data = {
-      sampleNumber,
-      timestamp: Date.now(),
-      Accel0: interpret16bitAsInt32(chunk.slice(26, 28)) * 0.000125,
-      Accel1: interpret16bitAsInt32(chunk.slice(28, 30)) * 0.000125,
-      Accel2: interpret16bitAsInt32(chunk.slice(30, 32)) * 0.000125,
-    };
-
-    // 4. Die 8 EEG-Kanäle auslesen (Kanäle 1-8 liegen an Byte-Offset 2 bis 25)
-    // Jeder Kanal besteht aus genau 3 Bytes (24-bit Integer)
-    for (let channel = 0; channel < 8; channel++) {
-      const startByte = 2 + (channel * 3);
-      const channelBytes = chunk.slice(startByte, startByte + 3);
-
-      const channelData = interpret24bitAsInt32(channelBytes) * 0.0223517445;
-      data[`A${channel + 1}`] = channelData;
     }
 
     return data;
