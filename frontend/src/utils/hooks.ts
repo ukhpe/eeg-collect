@@ -167,8 +167,6 @@ export const useOpenBCIUtils = () => {
   const impedanceRecordingStartTime = ref<string>("");
   const data = ref<OpenBCICytonData>(OPEN_BCI_CYTON_DATA_DEFAULT_VALUE);
 
-  // variable for browser caching
-  const currentSessionId = ref<string>("");
   // Buffer to accumulate data for batch insertion into Dexie
   let dexieBatchBuffer: EegData[] = [];
 
@@ -285,9 +283,6 @@ export const useOpenBCIUtils = () => {
       logToBackend("error", "WebSocket not open, chunk not sent.");
       return;
     }
-
-    // new Id for browswer caching
-    currentSessionId.value = `${participantId.value}_${getReadableTimestamp()}`;
 
     console.log("Setup Finished");
     ws.value.send("Setup Finished");
@@ -692,7 +687,7 @@ export const useOpenBCIUtils = () => {
   const clearEEGDataOnStart = async () => {
     try {
       await db.eegData.clear();
-      console.log("Dexie-Databank succesfully cleared on start.");
+      console.log("Dexie-Databank successfully cleared on start.");
     } catch (error) {
       console.error("Error clearing the Dexie database: ", error);
     }
@@ -701,9 +696,7 @@ export const useOpenBCIUtils = () => {
   // saves a chunk to Dexie db if the batchbuffer is "full", and triggers sync if buffer is full
   const saveChunkToDexie = (chunk: Uint8Array | number[]) => {
     dexieBatchBuffer.push({
-      sessionId: currentSessionId.value || 'pre_session',
       timestamp: Date.now(),
-      participantId: participantId.value || "unknown",
       payload: Array.from(new Uint8Array(chunk)),
     });
 
