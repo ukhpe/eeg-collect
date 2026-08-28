@@ -50,10 +50,15 @@ server.on("connection", (ws, req) => {
 
   let hasMainRecordingStarted = false;
 
-  const startTime = Math.floor(new Date().getTime() / 1000);
+  //const startTime = Math.floor(new Date().getTime() / 1000);
+
+  const startTimeFormated = new Date().toISOString()
+    .replace(/T/, '_')
+    .replace(/:/g, '-')
+    .split('.')[0];
 
   //creating new directory for the files
-  const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
+  const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTimeFormated);
 
 
   // ensure directory for recordings exists

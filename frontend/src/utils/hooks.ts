@@ -405,6 +405,8 @@ export const useOpenBCIUtils = () => {
 
                     // Use the throttled function to update rollingBuffer
                     throttledUpdateRollingBuffer(unthrottledBuffer);
+
+
                   }
                   break;
                 }
