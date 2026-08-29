@@ -736,7 +736,23 @@ export const useOpenBCIUtils = () => {
             idsToDelete.push(item.id);
           }
 
-          ws.value.send(new Uint8Array(item.payload));
+          console.log(item.payload);
+
+          // --- Timestamp und Payload kombinieren ---
+          const payloadBytes = new Uint8Array(item.payload);
+          const buffer = new ArrayBuffer(8 + payloadBytes.length);
+          const dataView = new DataView(buffer);
+
+          dataView.setFloat64(0, item.timestamp, true); // 8-Byte Timestamp (Little-Endian)
+
+          const combinedArray = new Uint8Array(buffer);
+          combinedArray.set(payloadBytes, 8); // Payload ab Offset 8 anhängen
+
+          ws.value.send(buffer);
+
+
+
+          //ws.value.send(new Uint8Array(item.payload));
         }
 
         await db.eegData.bulkDelete(idsToDelete);

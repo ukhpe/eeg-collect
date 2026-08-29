@@ -182,31 +182,26 @@ server.on("connection", (ws, req) => {
           rawBuffer = new Uint8Array(message);
         }
 
-        // Check if the message is a multiple of 33 bytes (e.g., 33, 66, 1650 bytes)
-        if (rawBuffer.length >= 33 && rawBuffer.length % 33 === 0) {
+        const dataView = new DataView(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+        const frontendTimestamp = dataView.getFloat64(0, true); // true = Little-Endian wie im Frontend
 
-          // Loop through all 33-byte blocks in the message
-          for (let offset = 0; offset < rawBuffer.length; offset += 33) {
+        // Take the 33-byte chunk from the raw buffer which are the eeg data bytes
+        const singleChunk = rawBuffer.slice(8);
 
-            // Take a single 33-byte chunk from the raw buffer
-            const singleChunk = rawBuffer.slice(offset, offset + 33);
+        console.log(singleChunk);
 
-            // decode the 33-byte chunk with old Cyton decoder
-            data = decodeCytonData(singleChunk);
+        // decode the 33-byte chunk with old Cyton decoder
+        data = decodeCytonData(singleChunk);
 
-            // If paket valid -> write to CSV
-            if (data) {
-              index += 1;
-              const datetime = new Date(data.timestamp).toLocaleString();
-              const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+        // If paket valid -> write to CSV
+        if (data) {
+          index += 1;
+          const datetime = new Date(frontendTimestamp).toLocaleString();
+          const csvRow = `${index};${datetime};${data.sampleNumber};${frontendTimestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
 
-              hasMainRecordingStarted
-                ? writeStream.write(csvRow)
-                : setupWriteStream.write(csvRow);
-            }
-          }
-        } else {
-          console.warn(`Received Buffer doesn´t have the correct length, it has (${rawBuffer.length} Bytes)`);
+          hasMainRecordingStarted
+            ? writeStream.write(csvRow)
+            : setupWriteStream.write(csvRow);
         }
 
       } else {
@@ -268,7 +263,7 @@ server.on("connection", (ws, req) => {
     const sampleNumber = chunk[1];
     const data = {
       sampleNumber,
-      timestamp: new Date().getTime(),
+      //timestamp: new Date().getTime(),   //not used anymore because we get the time from frontend
       Accel0: interpret16bitAsInt32(chunk.slice(26, 28)) * 0.000125,
       Accel1: interpret16bitAsInt32(chunk.slice(28, 30)) * 0.000125,
       Accel2: interpret16bitAsInt32(chunk.slice(30, 32)) * 0.000125,
