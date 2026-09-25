@@ -2,6 +2,7 @@ const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
+//const prisma = require('./db');
 
 const port = process.env.PORT || 3000;
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
@@ -68,6 +69,17 @@ server.on("connection", (ws, req) => {
   const deviceSetupFileName = `Setup.csv`;
   const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
   const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
+
+/*
+  // new Sesion will be added to Prisma DB
+  const newSession = prisma.study.create({
+    data: {
+      //studyId: defaultStudy.id, // here add the id of the study which the session belongs to
+      folderPath: sessionDir
+    }
+  });
+
+ */
 
 
   if (mode === "daisy") {
