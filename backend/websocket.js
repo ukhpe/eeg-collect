@@ -1,16 +1,121 @@
+require("dotenv").config();
+const http =  require("http");
+const express = require("express");
+const cors = require("cors");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
-//const prisma = require('./db');
+const { getPrismaClient } = require('./db');
+const jwt = require("jsonwebtoken");
+const bcrypt = require('bcrypt');
 
 const port = process.env.PORT || 3000;
+const SECRET_KEY = process.env.JWT_SECRET || "fallback_secret_key"; //maybe change
 const RECORDINGS_DIR = path.join(__dirname, "recordings");
 
 // Ensure the recordings directory exists
 if (!fs.existsSync(RECORDINGS_DIR)) {
   fs.mkdirSync(RECORDINGS_DIR);
 }
+
+// Express Application Setup
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+
+// HTTP REST Endpoints
+
+// Registration endpoint
+app.post("/api/register", async (req, res) => {
+  const { username, email, password} = req.body;
+
+  try {
+    const prisma = await getPrismaClient();
+
+    const existingUser = await prisma.user.findFirst({
+      where: { OR: [{ username }, { email }] },
+    });
+
+    if (existingUser) {
+      return res.status(400).json({ message: "Username/Mail already taken" }); //noch schauen was ich jz am ende alles benutz zum anmelden und was gespeichert wird
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = await prisma.user.create({
+      data: {
+        username,
+        email,
+        password: hashedPassword,
+      },
+    });
+
+    res.status(201).json({ message: "User was successfully registered", userId: newUser.id });
+  } catch (error) {
+    res.status(500).json({ message: "Registration error", error: error.message });
+  }
+})
+
+// Login endpoint
+app.post("/api/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  try {
+    const prisma = await getPrismaClient();
+
+    const user = await prisma.user.findUnique({ where: { username } });
+    if (!user) {
+      return res.status(401).json({ message: "Invalid login details." });
+    }
+
+    console.log("Name:", username);
+    console.log("Eingabe:", password, "DB-Hash:", user.passwordHash);
+
+    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+    console.log(isPasswordValid);
+    if (!isPasswordValid) {
+      return res.status(401).json({ message: "Invalid login details." });
+    }
+
+    // issue JWT Token
+    const token = jwt.sign(
+      { userId: user.id, username: user.username },
+      SECRET_KEY,
+      { expiresIn: "8h" }
+    );
+
+    res.json({
+      token,
+      userId: user.id,
+      username: user.username,
+    });
+  } catch (error) {
+    console.error("Login Error Details:", error);
+    res.status(500).json({ message: "Servererror while loging in.", error: error.message });
+  }
+});
+
+// study creation endpoint
+app.post("/api/studies", async (req, res) => {
+  const { title, userId, description } = req.body;
+
+  try {
+    const prisma = await getPrismaClient();
+
+    const study = await prisma.study.create({
+      data: {
+        title,
+        researcherId: userId,
+        description,
+      },
+    });
+    res.status(201).json(study);
+  } catch (error) {
+    res.status(500).json({ message: "Error while creating study", error: error.message });
+  }
+});
+
 
 
 /**
@@ -36,9 +141,10 @@ const writeLog = (targetDir, mode, level, contextMessage, errorDetails = "") => 
 
 
 // Create WebSocket server
-const server = new WebSocket.Server({ port });
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-server.on("connection", (ws, req) => {
+wss.on("connection", (ws, req) => {
   console.log("WebSocket connection established");
   const location = url.parse(req.url, true);
   const pathParts = location.pathname.split("/");
@@ -70,8 +176,8 @@ server.on("connection", (ws, req) => {
   const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
   const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
 
-/*
-  // new Sesion will be added to Prisma DB
+
+  // new sesion will be added to Prisma DB
   const newSession = prisma.study.create({
     data: {
       //studyId: defaultStudy.id, // here add the id of the study which the session belongs to
@@ -79,7 +185,6 @@ server.on("connection", (ws, req) => {
     }
   });
 
- */
 
 
   if (mode === "daisy") {
@@ -306,4 +411,9 @@ function interpret16bitAsInt32(byteArray) {
   return newInt;
 }
 
- console.log(`Server is running on http://localhost:${port}`);
+
+// Single Server Start (HTTP + WebSocket)
+server.listen(port, () => {
+  console.log(`HTTP Server running on http://localhost:${port}`);
+  console.log(`WebSocket Server listening on ws://localhost:${port}`);
+});
