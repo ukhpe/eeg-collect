@@ -22,8 +22,8 @@ const handleLogin = async () => {
   if (!username.value || !password.value) {
     errorModal.value = {
       isOpen: true,
-      title: "Fehlende Eingaben",
-      message: "Bitte gib Benutzername und Passwort ein.",
+      title: "Missing Input",
+      message: "Please enter your username and password.",
     };
     return;
   }
@@ -43,25 +43,26 @@ const handleLogin = async () => {
     const data = await response.json();
 
     if (response.ok) {
-      // Token & User-Informationen lokal speichern
+      // Store token & user information locally
       localStorage.setItem("user_token", data.token);
       localStorage.setItem("user_id", data.userId);
       localStorage.setItem("username", data.username);
+      localStorage.setItem("is_admin", data.isAdmin);
 
-      // Weiterleitung zum geschützten Dashboard
+      // Redirect to the protected dashboard
       router.push("/dashboard");
     } else {
       errorModal.value = {
         isOpen: true,
-        title: "Anmeldung fehlgeschlagen",
-        message: data.message || "Ungültige Anmeldedaten. Bitte versuche es erneut.",
+        title: "Login Failed",
+        message: data.message || "Invalid login credentials. Please try again.",
       };
     }
   } catch (error) {
     errorModal.value = {
       isOpen: true,
-      title: "Verbindungsfehler",
-      message: "Der Server ist aktuell nicht erreichbar.",
+      title: "Connection Error",
+      message: "The server is currently unreachable.",
     };
   } finally {
     isLoading.value = false;
@@ -80,16 +81,16 @@ const handleLogin = async () => {
         font-size: 18px;
       "
     >
-      Bitte melde dich an, um Zugriff auf die Studienverwaltung und <br />
-      das Dashboard zu erhalten.
+      Please log in to get access to the study management and <br />
+      the dashboard.
     </p>
 
-    <!-- Login Formular Container -->
+    <!-- Login Form Container -->
     <div class="login-form-container">
       <form @submit.prevent="handleLogin">
         <v-text-field
           v-model="username"
-          label="Benutzername"
+          label="Username"
           variant="outlined"
           density="comfortable"
           class="mb-2"
@@ -98,7 +99,7 @@ const handleLogin = async () => {
 
         <v-text-field
           v-model="password"
-          label="Passwort"
+          label="Password"
           type="password"
           variant="outlined"
           density="comfortable"
@@ -112,7 +113,7 @@ const handleLogin = async () => {
           :append-icon="PhSignIn"
           :loading="isLoading"
         >
-          Anmelden
+          Log In
         </VBtn>
       </form>
     </div>
@@ -126,8 +127,8 @@ const handleLogin = async () => {
         max-width: 600px;
       "
     >
-      Zugang nur für autorisierte Testleiter und Researcher. <br />
-      Probanden benötigen keine Anmeldung und nutzen den zugewiesenen Link.
+      Access only for authorized test administrators and researchers. <br />
+      Participants do not need to log in and use their assigned link.
     </p>
   </BasePage>
 
@@ -142,7 +143,7 @@ const handleLogin = async () => {
         style="margin-bottom: 8px"
       ></v-progress-circular>
       <v-card-text style="padding-bottom: 0">
-        Anmeldung wird überprüft...
+        Checking login...
       </v-card-text>
     </v-card>
   </v-dialog>
@@ -162,7 +163,7 @@ const handleLogin = async () => {
       </v-card-text>
 
       <v-card-actions class="pb-0" style="justify-content: end">
-        <VBtn @click="errorModal.isOpen = false" rounded="lg">Schließen</VBtn>
+        <VBtn @click="errorModal.isOpen = false" rounded="lg">Close</VBtn>
       </v-card-actions>
     </v-card>
   </v-dialog>

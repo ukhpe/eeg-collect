@@ -9,6 +9,7 @@ const url = require("url");
 const { getPrismaClient } = require('./db');
 const jwt = require("jsonwebtoken");
 const bcrypt = require('bcrypt');
+const archiver = require('archiver');
 
 const port = process.env.PORT || 3000;
 const SECRET_KEY = process.env.JWT_SECRET || "fallback_secret_key"; //maybe change
@@ -24,30 +25,67 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Decodes the Authorization header (if present) and attaches the matching user to req.authUser
+const attachAuthUser = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    req.authUser = null;
+    return next();
+  }
+
+  try {
+    const decoded = jwt.verify(token, SECRET_KEY);
+    const prisma = await getPrismaClient();
+    req.authUser = await prisma.user.findUnique({ where: { id: decoded.userId } });
+  } catch (error) {
+    req.authUser = null;
+  }
+
+  next();
+};
+
+app.use(attachAuthUser);
+
+// Rejects the request unless a valid, logged-in user is attached by attachAuthUser
+const requireAuth = (req, res, next) => {
+  if (!req.authUser) {
+    return res.status(401).json({ message: "Authentication required." });
+  }
+  next();
+};
+
 
 // HTTP REST Endpoints
 
 // Registration endpoint
 app.post("/api/register", async (req, res) => {
-  const { username, email, password} = req.body;
+  const { username, password, isAdmin } = req.body;
 
   try {
     const prisma = await getPrismaClient();
 
-    const existingUser = await prisma.user.findFirst({
-      where: { OR: [{ username }, { email }] },
-    });
+    // The very first user bootstraps the system and becomes an admin automatically.
+    // Every subsequent registration requires an authenticated admin.
+    const isBootstrap = (await prisma.user.count()) === 0;
 
-    if (existingUser) {
-      return res.status(400).json({ message: "Username/Mail already taken" }); //noch schauen was ich jz am ende alles benutz zum anmelden und was gespeichert wird
+    if (!isBootstrap && (!req.authUser || !req.authUser.isAdmin)) {
+      return res.status(403).json({ message: "Only admins can create new users." });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const existingUser = await prisma.user.findUnique({ where: { username } });
+
+    if (existingUser) {
+      return res.status(400).json({ message: "Username already taken" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
     const newUser = await prisma.user.create({
       data: {
         username,
-        email,
-        password: hashedPassword,
+        passwordHash,
+        isAdmin: isBootstrap ? true : !!isAdmin,
       },
     });
 
@@ -70,7 +108,7 @@ app.post("/api/login", async (req, res) => {
     }
 
     console.log("Name:", username);
-    console.log("Eingabe:", password, "DB-Hash:", user.passwordHash);
+    console.log("Input:", password, "DB-Hash:", user.passwordHash);
 
     const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
     console.log(isPasswordValid);
@@ -89,16 +127,33 @@ app.post("/api/login", async (req, res) => {
       token,
       userId: user.id,
       username: user.username,
+      isAdmin: user.isAdmin,
     });
   } catch (error) {
     console.error("Login Error Details:", error);
-    res.status(500).json({ message: "Servererror while loging in.", error: error.message });
+    res.status(500).json({ message: "Server error while logging in.", error: error.message });
+  }
+});
+
+// study listing endpoint
+app.get("/api/studies/list", requireAuth, async (req, res) => {
+  try {
+    const prisma = await getPrismaClient();
+
+    const studies = await prisma.study.findMany({
+      where: { userId: req.authUser.id },
+      orderBy: { id: "desc" },
+      include: { _count: { select: { sessions: true } } },
+    });
+    res.json(studies);
+  } catch (error) {
+    res.status(500).json({ message: "Error while fetching studies", error: error.message });
   }
 });
 
 // study creation endpoint
-app.post("/api/studies", async (req, res) => {
-  const { title, userId, description } = req.body;
+app.post("/api/studies/create", requireAuth, async (req, res) => {
+  const { title, description } = req.body;
 
   try {
     const prisma = await getPrismaClient();
@@ -106,13 +161,78 @@ app.post("/api/studies", async (req, res) => {
     const study = await prisma.study.create({
       data: {
         title,
-        researcherId: userId,
+        userId: req.authUser.id,
         description,
       },
     });
     res.status(201).json(study);
   } catch (error) {
+    console.log(error.message);
     res.status(500).json({ message: "Error while creating study", error: error.message });
+  }
+});
+
+// study data download endpoint
+app.get("/api/studies/:id/download", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const prisma = await getPrismaClient();
+
+    const study = await prisma.study.findUnique({ where: { id: Number(id) } });
+    if (!study) {
+      return res.status(404).json({ message: "Study not found" });
+    }
+
+    if (study.userId !== req.authUser.id) {
+      return res.status(403).json({ message: "You do not have access to this study." });
+    }
+
+    const studyDir = path.join(RECORDINGS_DIR, `${study.userId}`, `${study.id}`);
+    if (!fs.existsSync(studyDir)) {
+      return res.status(404).json({ message: "No data exists for this study yet" });
+    }
+
+    const safeTitle = study.title.replace(/[^a-z0-9]+/gi, "_");
+    res.attachment(`study-${study.id}-${safeTitle}.zip`);
+
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (archiveError) => {
+      console.error("Error while zipping study data:", archiveError);
+      res.status(500).end();
+    });
+
+    archive.pipe(res);
+    archive.directory(studyDir, false);
+    archive.finalize();
+  } catch (error) {
+    res.status(500).json({ message: "Error while downloading study data", error: error.message });
+  }
+});
+
+// study deletion endpoint
+app.delete("/api/studies/:id/delete", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const prisma = await getPrismaClient();
+
+    const study = await prisma.study.findUnique({ where: { id: Number(id) } });
+    if (!study) {
+      return res.status(404).json({ message: "Study not found" });
+    }
+
+    if (study.userId !== req.authUser.id) {
+      return res.status(403).json({ message: "You do not have access to this study." });
+    }
+
+    await prisma.$transaction([
+      prisma.session.deleteMany({ where: { studyId: Number(id) } }),
+      prisma.study.delete({ where: { id: Number(id) } }),
+    ]);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ message: "Error while deleting study", error: error.message });
   }
 });
 
@@ -144,23 +264,41 @@ const writeLog = (targetDir, mode, level, contextMessage, errorDetails = "") => 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   console.log("WebSocket connection established");
   const location = url.parse(req.url, true);
   const pathParts = location.pathname.split("/");
   const mode = pathParts[2];
   const participant = pathParts[3]; // Assuming the path is /websocket/participant1
-  console.log(`mode: ${mode} participant: ${participant}`);
+  const studyId = location.query.studyId;
+  console.log(`mode: ${mode} participant: ${participant} studyId: ${studyId}`);
 
-  const researcher = "default_researcher" //changed when adding the IAM
-  const study = "default_study" //changed when adding the IAM
+  let prisma;
+  let study;
+  try {
+    prisma = await getPrismaClient();
+    study = await prisma.study.findUnique({ where: { id: Number(studyId) } });
+  } catch (error) {
+    console.error("Error while looking up study for websocket connection:", error);
+    ws.close(1011, "Server error while looking up study");
+    return;
+  }
+
+  if (!study) {
+    console.error(`No study found for studyId: ${studyId}`);
+    ws.close(1008, "Invalid study id");
+    return;
+  }
+
+  const researcher = `${study.userId}`
+  const studyFolder = `${study.id}`
 
   let hasMainRecordingStarted = false;
 
   const startTime = Math.floor(new Date().getTime() / 1000);
 
   //creating new directory for the files
-  const sessionDir = path.join(RECORDINGS_DIR, researcher, study, participant, startTime.toString());
+  const sessionDir = path.join(RECORDINGS_DIR, researcher, studyFolder, participant, startTime.toString());
 
 
   // ensure directory for recordings exists
@@ -178,9 +316,9 @@ wss.on("connection", (ws, req) => {
 
 
   // new sesion will be added to Prisma DB
-  const newSession = prisma.study.create({
+  const newSession = await prisma.session.create({
     data: {
-      //studyId: defaultStudy.id, // here add the id of the study which the session belongs to
+      studyId: study.id,
       folderPath: sessionDir
     }
   });
@@ -225,6 +363,18 @@ wss.on("connection", (ws, req) => {
             `[Frontend] ${parsed.message}`,
             parsed.details
           );
+          return;
+        }
+
+        if (parsed.event === "save_impedance_csv") {
+          const safeFileName = path.basename(parsed.fileName);
+          const impedanceFilePath = path.join(sessionDir, safeFileName);
+
+          fs.writeFile(impedanceFilePath, parsed.csvContent, (writeErr) => {
+            if (writeErr) {
+              writeLog(sessionDir, mode, "ERROR", "Failed to save impedance CSV", writeErr);
+            }
+          });
           return;
         }
       }

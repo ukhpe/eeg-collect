@@ -68,6 +68,7 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
   const channelConfig = computed(
     () => UrlRoute.query[URL_PARAMS.channelConfig],
   );
+  const studyId = computed(() => UrlRoute.query[URL_PARAMS.studyIdParam]);
   const channelAssignment = CHANNEL_ASSIGNMENT[`${channelConfig.value}`] || {};
   const mode =
     Object.keys(channelAssignment).length > 8
@@ -78,7 +79,8 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
     !channelConfig.value ||
     !channelAssignment ||
     !mode ||
-    !participantId.value
+    !participantId.value ||
+    !studyId.value
   ) {
     return null;
   }
@@ -100,7 +102,7 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
 
   console.log("A");
   const ws = await createWebSocket(
-    `${URLs.WEB_SOCKET_URL}${mode}/${participantId.value}/`,
+    `${URLs.WEB_SOCKET_URL}${mode}/${participantId.value}/?studyId=${studyId.value}`,
   );
 
   console.log("B");
@@ -118,12 +120,18 @@ export const useOpenBCIUtils = () => {
     if (level === 'error') console.error(`${message}`, details || '');
     if (level === 'warn') console.warn(`${message}`, details || '');
 
+    const serializedDetails = details instanceof Error
+      ? JSON.stringify({ name: details.name, message: details.message, stack: details.stack })
+      : details
+        ? JSON.stringify(details)
+        : null;
+
     if (ws.value && ws.value.readyState === WebSocket.OPEN) {
       ws.value.send(JSON.stringify({
         event: "frontend_log",
         level: level,
         message: message,
-        details: details ? JSON.stringify(details) : null
+        details: serializedDetails
       }));
     }
   };
@@ -261,11 +269,14 @@ export const useOpenBCIUtils = () => {
       if (port.value && port.value.writable) {
         const writer = port.value.writable.getWriter();
 
-        await writer.write(
-          getEncodedCytonCommand(CytonBoardCommands.STOP_STREAMING),
-        );
-        console.log("Cyton Streaming stopped");
-        writer.releaseLock();
+        try {
+          await writer.write(
+            getEncodedCytonCommand(CytonBoardCommands.STOP_STREAMING),
+          );
+          console.log("Cyton Streaming stopped");
+        } finally {
+          writer.releaseLock();
+        }
       } else {
         logToBackend("error", "Serial port is not writable");
       }
@@ -1105,27 +1116,19 @@ export const useOpenBCIUtils = () => {
     );
     const fileName = `${participantId.value}-${startTime}-Impedance.csv`;
 
-    const formData = new FormData();
-    formData.append("fileName", fileName);
-    formData.append("csvContent", csvContent);
+    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
+      logToBackend("error", "Error saving CSV file: WebSocket not open");
+      return;
+    }
 
-    await fetch("/api/save-csv", {
-      method: "POST",
-      body: formData,
-    })
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error("Network response was not ok");
-        }
-        return response.json();
-      })
-      .then((data) => {
-        console.log("CSV file saved successfully:", data.filePath);
-        isRecording.value = false;
-      })
-      .catch((error) => {
-        logToBackend("error", "Error saving CSV file:", error);
-      });
+    ws.value.send(JSON.stringify({
+      event: "save_impedance_csv",
+      fileName,
+      csvContent,
+    }));
+
+    console.log("Impedance CSV sent to backend:", fileName);
+    isRecording.value = false;
   };
 
   // @ts-ignore-next-line
