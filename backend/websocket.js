@@ -95,6 +95,85 @@ app.post("/api/register", async (req, res) => {
   }
 })
 
+// Rejects the request unless the logged-in user is an admin
+const requireAdmin = (req, res, next) => {
+  if (!req.authUser || !req.authUser.isAdmin) {
+    return res.status(403).json({ message: "Admin rights required." });
+  }
+  next();
+};
+
+// user listing endpoint (admin only)
+app.get("/api/users/list", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const prisma = await getPrismaClient();
+    const users = await prisma.user.findMany({
+      orderBy: { id: "asc" },
+      select: { id: true, username: true, isAdmin: true },
+    });
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ message: "Error while fetching users", error: error.message });
+  }
+});
+
+// grant / revoke admin rights (admin only, not for oneself)
+app.patch("/api/users/:id/admin", requireAuth, requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const { isAdmin } = req.body;
+
+  try {
+    if (typeof isAdmin !== "boolean") {
+      return res.status(400).json({ message: "isAdmin must be a boolean." });
+    }
+    if (id === req.authUser.id) {
+      return res.status(400).json({ message: "You cannot change your own admin rights." });
+    }
+
+    const prisma = await getPrismaClient();
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    const updated = await prisma.user.update({
+      where: { id },
+      data: { isAdmin },
+      select: { id: true, username: true, isAdmin: true },
+    });
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ message: "Error while updating user", error: error.message });
+  }
+});
+
+// user deletion endpoint (admin only) - also removes the user's studies and sessions
+app.delete("/api/users/:id/delete", requireAuth, requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+
+  try {
+    const prisma = await getPrismaClient();
+
+    if (id === req.authUser.id) {
+      return res.status(400).json({ message: "You cannot delete your own account." });
+    }
+
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    await prisma.$transaction([
+      prisma.session.deleteMany({ where: { study: { userId: id } } }),
+      prisma.study.deleteMany({ where: { userId: id } }),
+      prisma.user.delete({ where: { id } }),
+    ]);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ message: "Error while deleting user", error: error.message });
+  }
+});
+
 // Login endpoint
 app.post("/api/login", async (req, res) => {
   const { username, password } = req.body;
@@ -295,7 +374,12 @@ wss.on("connection", async (ws, req) => {
 
   let hasMainRecordingStarted = false;
 
-  const startTime = Math.floor(new Date().getTime() / 1000);
+  // Session folder name in local time, e.g. 2026-08-28_12-44-26
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const startTime =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 
   //creating new directory for the files
   const sessionDir = path.join(RECORDINGS_DIR, researcher, studyFolder, participant, startTime.toString());
@@ -305,6 +389,16 @@ wss.on("connection", async (ws, req) => {
   if (!fs.existsSync(sessionDir)) {
     fs.mkdirSync(sessionDir, { recursive: true });
   }
+
+  // let the frontend know where this session's files live, so it can tell
+  // other services (e.g. the CSV-saving Express server) where to write to
+  ws.send(JSON.stringify({
+    event: "session_folder",
+    researcherId: researcher,
+    studyId: studyFolder,
+    participantId: participant,
+    startTime: startTime.toString(),
+  }));
 
   const fileName = `Recording.csv`;
   const filePath = path.join(sessionDir, fileName);
@@ -363,18 +457,6 @@ wss.on("connection", async (ws, req) => {
             `[Frontend] ${parsed.message}`,
             parsed.details
           );
-          return;
-        }
-
-        if (parsed.event === "save_impedance_csv") {
-          const safeFileName = path.basename(parsed.fileName);
-          const impedanceFilePath = path.join(sessionDir, safeFileName);
-
-          fs.writeFile(impedanceFilePath, parsed.csvContent, (writeErr) => {
-            if (writeErr) {
-              writeLog(sessionDir, mode, "ERROR", "Failed to save impedance CSV", writeErr);
-            }
-          });
           return;
         }
       }

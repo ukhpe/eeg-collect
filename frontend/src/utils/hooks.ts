@@ -98,6 +98,29 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
         console.error("WebSocket error:", error);
         reject(error);
       };
+
+      socket.onmessage = (event) => {
+        if (typeof event.data !== "string" || !event.data.startsWith("{")) {
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(event.data);
+
+          if (parsed.event === "session_folder") {
+            store.commit("setSessionFolder", {
+              sessionFolder: {
+                researcherId: parsed.researcherId,
+                studyId: parsed.studyId,
+                participantId: parsed.participantId,
+                startTime: parsed.startTime,
+              },
+            });
+          }
+        } catch (error) {
+          // Not a JSON control message (e.g. raw EEG data) — ignore
+        }
+      };
     });
 
   console.log("A");
@@ -161,6 +184,7 @@ export const useOpenBCIUtils = () => {
 
   const store = useStore();
   const ws = computed(() => store.state.webSocket);
+  const sessionFolder = computed(() => store.state.sessionFolder);
 
   const participantId = computed(() => store.state.participantId);
 
@@ -630,7 +654,7 @@ export const useOpenBCIUtils = () => {
         setIsLoadingModalShown(false);
       }
 
-      // TODO Wenn die App Unmounted, Reader releasen. Aber nicht hier!!!
+      // TODO: Release the reader when the app is unmounted, but not here!
     }
   };
 
@@ -1116,19 +1140,33 @@ export const useOpenBCIUtils = () => {
     );
     const fileName = `${participantId.value}-${startTime}-Impedance.csv`;
 
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-      logToBackend("error", "Error saving CSV file: WebSocket not open");
-      return;
+    const formData = new FormData();
+    formData.append("fileName", fileName);
+    if (sessionFolder.value) {
+      formData.append("researcherId", sessionFolder.value.researcherId);
+      formData.append("studyId", sessionFolder.value.studyId);
+      formData.append("participantId", sessionFolder.value.participantId);
+      formData.append("startTime", sessionFolder.value.startTime);
     }
+    formData.append("csvContent", csvContent);
 
-    ws.value.send(JSON.stringify({
-      event: "save_impedance_csv",
-      fileName,
-      csvContent,
-    }));
-
-    console.log("Impedance CSV sent to backend:", fileName);
-    isRecording.value = false;
+    await fetch("/api/save-csv", {
+      method: "POST",
+      body: formData,
+    })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("Network response was not ok");
+        }
+        return response.json();
+      })
+      .then((data) => {
+        console.log("CSV file saved successfully:", data.filePath);
+        isRecording.value = false;
+      })
+      .catch((error) => {
+        logToBackend("error", "Error saving CSV file:", error);
+      });
   };
 
   // @ts-ignore-next-line

@@ -9,7 +9,7 @@ import {
   PhFolder,
   PhWarningCircle,
   PhTrash,
-  PhUserPlus,
+  PhUsers,
   PhDownloadSimple,
 } from "@phosphor-icons/vue";
 
@@ -55,12 +55,27 @@ const authHeaders = () => ({
   Authorization: `Bearer ${localStorage.getItem("user_token")}`,
 });
 
-// Create User Modal State
-const isCreateUserModalOpen = ref(false);
+// User Management Modal State
+interface ManagedUser {
+  id: number;
+  username: string | null;
+  isAdmin: boolean;
+}
+const isUsersModalOpen = ref(false);
+const isLoadingUsers = ref(false);
+const users = ref<ManagedUser[]>([]);
+
+// Create User form State
 const isCreatingUser = ref(false);
 const newUsername = ref("");
 const newUserPassword = ref("");
 const newUserIsAdmin = ref(false);
+
+// Delete User Modal State
+const isDeleteUserModalOpen = ref(false);
+const isDeletingUser = ref(false);
+const userToDelete = ref<ManagedUser | null>(null);
+const deleteConfirmationUsername = ref("");
 
 // ---- METHODS ----
 
@@ -153,11 +168,96 @@ const handleDeleteStudy = async () => {
   }
 };
 
-const closeCreateUserModal = () => {
-  isCreateUserModalOpen.value = false;
+const resetCreateUserForm = () => {
   newUsername.value = "";
   newUserPassword.value = "";
   newUserIsAdmin.value = false;
+};
+
+const fetchUsers = async () => {
+  isLoadingUsers.value = true;
+  try {
+    const response = await fetch("http://localhost:3000/api/users/list", {
+      headers: authHeaders(),
+    });
+    if (response.ok) {
+      users.value = await response.json();
+    } else {
+      showError("Error", "Users could not be loaded.");
+    }
+  } catch (error) {
+    showError("Connection Error", "Server is not reachable.");
+  } finally {
+    isLoadingUsers.value = false;
+  }
+};
+
+const openUsersModal = () => {
+  isUsersModalOpen.value = true;
+  fetchUsers();
+};
+
+const closeUsersModal = () => {
+  isUsersModalOpen.value = false;
+  resetCreateUserForm();
+};
+
+const handleToggleAdmin = async (user: ManagedUser, makeAdmin: boolean) => {
+  try {
+    const response = await fetch(
+      `http://localhost:3000/api/users/${user.id}/admin`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ isAdmin: makeAdmin }),
+      },
+    );
+
+    if (response.ok) {
+      user.isAdmin = makeAdmin;
+    } else {
+      const data = await response.json().catch(() => null);
+      showError("Error", data?.message || "Admin rights could not be changed.");
+    }
+  } catch (error) {
+    showError("Connection Error", "Server is not reachable.");
+  }
+};
+
+const openDeleteUserModal = (user: ManagedUser) => {
+  userToDelete.value = user;
+  isDeleteUserModalOpen.value = true;
+};
+
+const closeDeleteUserModal = () => {
+  isDeleteUserModalOpen.value = false;
+  userToDelete.value = null;
+  deleteConfirmationUsername.value = "";
+};
+
+const handleDeleteUser = async () => {
+  if (!userToDelete.value) return;
+  if (deleteConfirmationUsername.value !== userToDelete.value.username) return;
+
+  isDeletingUser.value = true;
+  try {
+    const response = await fetch(
+      `http://localhost:3000/api/users/${userToDelete.value.id}/delete`,
+      { method: "DELETE", headers: authHeaders() },
+    );
+
+    if (response.ok) {
+      users.value = users.value.filter((u) => u.id !== userToDelete.value!.id);
+      closeDeleteUserModal();
+    } else {
+      const data = await response.json().catch(() => null);
+      showError("Error", data?.message || "User could not be deleted.");
+    }
+  } catch (error) {
+    showError("Connection Error", "Server is not reachable.");
+  } finally {
+    isDeletingUser.value = false;
+  }
 };
 
 const handleCreateUser = async () => {
@@ -176,7 +276,8 @@ const handleCreateUser = async () => {
     });
 
     if (response.ok) {
-      closeCreateUserModal();
+      resetCreateUserForm();
+      await fetchUsers();
     } else {
       const data = await response.json();
       showError("Error", data.message || "User could not be created.");
@@ -267,10 +368,10 @@ onMounted(() => {
             v-if="isAdmin"
             variant="tonal"
             color="#00594C"
-            :prepend-icon="PhUserPlus"
-            @click="isCreateUserModalOpen = true"
+            :prepend-icon="PhUsers"
+            @click="openUsersModal"
           >
-            Create new user
+            Manage users
           </VBtn>
           <VBtn
             color="#00594C"
@@ -414,14 +515,64 @@ onMounted(() => {
     </v-card>
   </v-dialog>
 
-  <!-- Modal: Create New User -->
-  <v-dialog v-model="isCreateUserModalOpen" max-width="500px" persistent>
+  <!-- Modal: Manage Users -->
+  <v-dialog v-model="isUsersModalOpen" max-width="560px" persistent>
     <v-card style="padding: 24px; border-radius: 12px;">
       <v-card-title class="px-0 pt-0 mb-2" style="font-weight: 600;">
-        Create New User
+        Manage Users
       </v-card-title>
 
       <v-card-text class="px-0 py-2">
+        <div v-if="isLoadingUsers" class="text-center py-4">
+          <v-progress-circular indeterminate color="#00594C"></v-progress-circular>
+        </div>
+
+        <div v-else style="max-height: 260px; overflow-y: auto;" class="mb-4">
+          <div
+            v-for="user in users"
+            :key="user.id"
+            class="d-flex justify-space-between align-center py-2 px-3 mb-2"
+            style="border: 1px solid #e2e8f0; border-radius: 8px;"
+          >
+            <div>
+              <span style="font-weight: 500; color: #2c3e50;">{{ user.username }}</span>
+              <v-chip
+                v-if="String(user.id) === userId"
+                size="x-small"
+                variant="tonal"
+                class="ml-2"
+              >
+                You
+              </v-chip>
+            </div>
+            <div class="d-flex align-center" style="gap: 12px;">
+            <v-switch
+              :model-value="user.isAdmin"
+              label="Admin"
+              color="#00594C"
+              density="compact"
+              hide-details
+              inset
+              :disabled="String(user.id) === userId"
+              @update:model-value="(val) => handleToggleAdmin(user, !!val)"
+            ></v-switch>
+            <VBtn
+              variant="tonal"
+              color="red"
+              icon
+              :width="36"
+              :height="36"
+              :disabled="String(user.id) === userId"
+              @click="openDeleteUserModal(user)"
+            >
+              <PhTrash :size="16" />
+            </VBtn>
+            </div>
+          </div>
+        </div>
+
+        <h4 class="mb-3" style="font-weight: 600; color: #333;">Create new user</h4>
+
         <v-text-field
           v-model="newUsername"
           label="Username *"
@@ -454,9 +605,9 @@ onMounted(() => {
         <VBtn
           variant="text"
           color="#737373"
-          @click="closeCreateUserModal"
+          @click="closeUsersModal"
         >
-          Cancel
+          Close
         </VBtn>
         <VBtn
           color="#00594C"
@@ -466,6 +617,46 @@ onMounted(() => {
           @click="handleCreateUser"
         >
           Create new user
+        </VBtn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+
+  <!-- Modal: Delete User -->
+  <v-dialog v-model="isDeleteUserModalOpen" max-width="500px">
+    <v-card style="padding: 24px; border-radius: 12px;">
+      <v-card-title class="px-0 pt-0 mb-2" style="font-weight: 600;">
+        Delete User
+      </v-card-title>
+
+      <v-card-text class="px-0 py-2">
+        Do you really want to delete the user "{{ userToDelete?.username }}"?
+        All of their studies and sessions will be deleted as well.
+        This action cannot be undone.
+
+        <v-text-field
+          v-model="deleteConfirmationUsername"
+          :label="`Type &quot;${userToDelete?.username}&quot; to confirm`"
+          variant="outlined"
+          density="comfortable"
+          class="mt-4"
+          hide-details="auto"
+          @keyup.enter="handleDeleteUser"
+        ></v-text-field>
+      </v-card-text>
+
+      <v-card-actions class="px-0 pb-0 mt-4" style="justify-content: end;">
+        <VBtn variant="text" color="#737373" @click="closeDeleteUserModal">
+          Cancel
+        </VBtn>
+        <VBtn
+          color="red"
+          style="background-color: #c62828; color: white;"
+          :disabled="deleteConfirmationUsername !== userToDelete?.username"
+          :loading="isDeletingUser"
+          @click="handleDeleteUser"
+        >
+          Delete
         </VBtn>
       </v-card-actions>
     </v-card>
