@@ -554,7 +554,7 @@ onMounted(() => {
               hide-details
               inset
               :disabled="String(user.id) === userId"
-              @update:model-value="(val) => handleToggleAdmin(user, !!val)"
+              @update:model-value="(val: boolean | null) => handleToggleAdmin(user, !!val)"
             ></v-switch>
             <VBtn
               variant="tonal"

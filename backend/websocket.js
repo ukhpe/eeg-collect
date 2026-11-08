@@ -117,7 +117,7 @@ app.get("/api/users/list", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
-// grant / revoke admin rights (admin only, not for oneself)
+// grant / revoke admin rights (admin only)
 app.patch("/api/users/:id/admin", requireAuth, requireAdmin, async (req, res) => {
   const id = Number(req.params.id);
   const { isAdmin } = req.body;
