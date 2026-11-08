@@ -1,17 +1,15 @@
-// 1. Die URL definieren und setzen BEVOR der PrismaClient importiert wird.
-// So ist sichergestellt, dass Prisma nie "undefined" liest.
+// 1. Define and set the URL BEFORE importing the PrismaClient,
+// so Prisma never reads "undefined".
 const dbUrl = 'file:./dev.db';
 process.env.DATABASE_URL = dbUrl;
 
 const { PrismaClient } = require('@prisma/client');
 
-// Den manuellen Import von @libsql/client (createClient) brauchen wir nicht mehr!
-
 const prismaPromise = (async () => {
   const mod = await import('@prisma/adapter-libsql');
   const PrismaLibSQL = mod.PrismaLibSql || mod.PrismaLibSQL || mod.default?.PrismaLibSql || mod.default;
 
-  // 2. Das Konfigurationsobjekt DIREKT an den Adapter übergeben
+  // 2. Pass the configuration object directly to the adapter
   const adapter = new PrismaLibSQL({
     url: dbUrl,
   });
