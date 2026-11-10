@@ -1135,9 +1135,9 @@ export const useOpenBCIUtils = () => {
       impedanceDataRaw.value,
       objectKeys,
     );
-    const startTime = Math.floor(
-      new Date(impedanceRecordingStartTime.value).getTime() / 1000,
-    );
+    const startTime = impedanceRecordingStartTime.value
+      .replace(" ", "_")
+      .replace(/:/g, "-");
     const fileName = `${participantId.value}-${startTime}-Impedance.csv`;
 
     const formData = new FormData();

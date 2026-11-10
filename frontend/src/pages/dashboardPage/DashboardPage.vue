@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
+import { useRouter } from "vue-router";
 import BasePage from "@/components/BasePage.vue";
 import { URL_PARAMS, getEncodedPassphrase } from "@/utils/helpers";
 import {
@@ -11,6 +12,7 @@ import {
   PhTrash,
   PhUsers,
   PhDownloadSimple,
+  PhSignOut,
 } from "@phosphor-icons/vue";
 
 // ---- TYPES ----
@@ -77,7 +79,17 @@ const isDeletingUser = ref(false);
 const userToDelete = ref<ManagedUser | null>(null);
 const deleteConfirmationUsername = ref("");
 
+const router = useRouter();
+
 // ---- METHODS ----
+
+const handleLogout = () => {
+  localStorage.removeItem("user_token");
+  localStorage.removeItem("user_id");
+  localStorage.removeItem("username");
+  localStorage.removeItem("is_admin");
+  router.push("/login");
+};
 
 const fetchStudies = async () => {
   if (!userId) return;
@@ -364,6 +376,14 @@ onMounted(() => {
       <div class="d-flex justify-space-between align-center mb-6">
         <h3 style="color: #333; font-weight: 600;">Your Studies</h3>
         <div class="d-flex align-center" style="gap: 8px;">
+          <VBtn
+            variant="text"
+            color="#737373"
+            :prepend-icon="PhSignOut"
+            @click="handleLogout"
+          >
+            Logout
+          </VBtn>
           <VBtn
             v-if="isAdmin"
             variant="tonal"
