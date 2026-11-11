@@ -343,6 +343,25 @@ const writeLog = (targetDir, mode, level, contextMessage, errorDetails = "") => 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// bc: Sessions with an open connection, key = session folder.
+// bc: Lets a reconnecting frontend continue with the same files, index and setup flag.
+const activeSessions = new Map();
+
+// bc: Format of the session folder names, e.g. 2026-08-28_12-44-26
+const SESSION_FOLDER_PATTERN = /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/;
+
+// bc: Number of data rows in a CSV file (all lines without the header).
+// bc: Used to continue the Index column when a session is resumed after a backend restart.
+const countCsvDataRows = (filePath) => {
+  if (!fs.existsSync(filePath)) return 0;
+  const content = fs.readFileSync(filePath);
+  let lines = 0;
+  for (const byte of content) {
+    if (byte === 0x0a) lines += 1;
+  }
+  return Math.max(lines - 1, 0);
+};
+
 wss.on("connection", async (ws, req) => {
   console.log("WebSocket connection established");
   const location = url.parse(req.url, true);
@@ -372,14 +391,21 @@ wss.on("connection", async (ws, req) => {
   const researcher = `${study.userId}`
   const studyFolder = `${study.id}`
 
-  let hasMainRecordingStarted = false;
+  // bc: A reconnecting frontend sends the folder of its session (?resume=<startTime>).
+  // bc: Only accepted if it has the expected format and the folder exists.
+  const resumeFolder = location.query.resume;
+  const isResume =
+    typeof resumeFolder === "string" &&
+    SESSION_FOLDER_PATTERN.test(resumeFolder) &&
+    fs.existsSync(path.join(RECORDINGS_DIR, researcher, studyFolder, participant, resumeFolder));
 
   // Session folder name in local time, e.g. 2026-08-28_12-44-26
   const now = new Date();
   const pad = (n) => String(n).padStart(2, "0");
-  const startTime =
-    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
-    `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  const startTime = isResume // bc: keep the folder of the resumed session
+    ? resumeFolder
+    : `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+      `_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
 
   //creating new directory for the files
   const sessionDir = path.join(RECORDINGS_DIR, researcher, studyFolder, participant, startTime.toString());
@@ -390,54 +416,113 @@ wss.on("connection", async (ws, req) => {
     fs.mkdirSync(sessionDir, { recursive: true });
   }
 
-  // let the frontend know where this session's files live, so it can tell
-  // other services (e.g. the CSV-saving Express server) where to write to
-  ws.send(JSON.stringify({
-    event: "session_folder",
-    researcherId: researcher,
-    studyId: studyFolder,
-    participantId: participant,
-    startTime: startTime.toString(),
-  }));
+  if (isResume) {
+    console.log(`bc: resuming session ${sessionDir}`);
+  }
+
+  // bc: The "session_folder" message was moved to the end of this handler (see there)
+
+  // new sesion will be added to Prisma DB
+  // bc: but not for a resumed session, it already exists in the DB.
+  // bc: Moved up, so there is no await between registering the session and the handlers below.
+  if (!isResume) {
+    await prisma.session.create({
+      data: {
+        studyId: study.id,
+        folderPath: sessionDir
+      }
+    });
+  }
 
   const fileName = `Recording.csv`;
   const filePath = path.join(sessionDir, fileName);
-  const writeStream = fs.createWriteStream(filePath);
 
   const deviceSetupFileName = `Setup.csv`;
   const deviceSetupFilePath = path.join(sessionDir, deviceSetupFileName);
-  const setupWriteStream = fs.createWriteStream(deviceSetupFilePath);
 
+  // bc: The state of a session (files, Index counter, setup flag) is shared between all
+  // bc: connections of the same session, so it continues after a reconnect.
+  let session = activeSessions.get(sessionDir);
 
-  // new sesion will be added to Prisma DB
-  const newSession = await prisma.session.create({
-    data: {
-      studyId: study.id,
-      folderPath: sessionDir
+  if (!session) {
+    // bc: Headers are only written to new files, resumed files already have them
+    const isNewFile = !fs.existsSync(filePath);
+
+    session = {
+      // bc: "a" = append, so a resumed session keeps the data it already has
+      writeStream: fs.createWriteStream(filePath, { flags: isResume ? "a" : "w" }),
+      setupWriteStream: fs.createWriteStream(deviceSetupFilePath, { flags: isResume ? "a" : "w" }),
+      // bc: After a backend restart the Index continues from the rows already in the files
+      index: isResume ? countCsvDataRows(filePath) + countCsvDataRows(deviceSetupFilePath) : 0,
+      // bc: The frontend tells us whether "Setup Finished" was already sent
+      hasMainRecordingStarted: isResume && location.query.setupFinished === "1",
+      previousData: null,
+      sockets: new Set(),
+    };
+    activeSessions.set(sessionDir, session);
+
+    if (isNewFile) {
+      if (mode === "daisy") {
+        // Write the CSV header
+        session.writeStream.write(
+          "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;A9;A10;A11;A12;A13;A14;A15;A16;Accel0;Accel1;Accel2\n",
+        );
+        session.setupWriteStream.write(
+          "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;A9;A10;A11;A12;A13;A14;A15;A16;Accel0;Accel1;Accel2\n",
+        );
+      } else if (mode === "cyton") {
+        // Write the CSV header
+        session.writeStream.write(
+          "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;Accel0;Accel1;Accel2;Note\n",
+        );
+        session.setupWriteStream.write(
+          "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;Accel0;Accel1;Accel2;Note\n",
+        );
+      }
     }
-  });
-
-
-
-  if (mode === "daisy") {
-    // Write the CSV header
-    writeStream.write(
-      "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;A9;A10;A11;A12;A13;A14;A15;A16;Accel0;Accel1;Accel2\n",
-    );
-    setupWriteStream.write(
-      "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;A9;A10;A11;A12;A13;A14;A15;A16;Accel0;Accel1;Accel2\n",
-    );
-  } else if (mode === "cyton") {
-    // Write the CSV header
-    writeStream.write(
-      "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;Accel0;Accel1;Accel2;Note\n",
-    );
-    setupWriteStream.write(
-      "Index;Datetime;sampleNumber;timestamp;A1;A2;A3;A4;A5;A6;A7;A8;Accel0;Accel1;Accel2;Note\n",
-    );
   }
-  let index = 0;
-  let previousData = null;
+
+  // bc: If the old connection of this session is still known (e.g. the backend did not notice
+  // bc: that the network was gone), close it so only the new connection writes to the files.
+  for (const oldSocket of session.sockets) {
+    oldSocket.terminate();
+  }
+  session.sockets.add(ws);
+
+  // bc: The variables writeStream, setupWriteStream, index, hasMainRecordingStarted and
+  // bc: previousData were moved into the shared session object (session.xxx) below.
+
+  // bc: Handles "Setup Finished" and the audio markers, for both the cached JSON messages
+  // bc: and the old plain-text messages. The marker row is the same as before, but its
+  // bc: Datetime is the time the marker happened (important when it arrives late after a reconnect).
+  // bc: Returns true if the text was a control message.
+  const AUDIO_MARKER_NOTES = new Map([
+    ["Audio File Started", "Audio Recording Started"],
+    ["Audio File Ended", "Audio Recording Ended"],
+  ]);
+
+  const handleControlMessage = (text, timestamp) => {
+    if (text === "Setup Finished") {
+      session.hasMainRecordingStarted = true;
+      return true;
+    }
+
+    const note = AUDIO_MARKER_NOTES.get(text);
+    if (!note) {
+      return false;
+    }
+
+    session.index += 1;
+    const datetime = new Date(timestamp).toLocaleString();
+    const csvRow = `${session.index};${datetime};;;;;;;;;;;;;;${note}\n`;
+
+    !session.hasMainRecordingStarted
+        ? session.setupWriteStream.write(csvRow)
+        : session.writeStream.write(csvRow);
+
+    console.log(text);
+    return true;
+  };
 
   ws.on("message", (message) => {
     try {
@@ -459,62 +544,44 @@ wss.on("connection", async (ws, req) => {
           );
           return;
         }
+
+        // bc: Control message from the browser cache, with the time it happened in the frontend
+        if (parsed.event === "control") {
+          handleControlMessage(parsed.message, parsed.timestamp);
+          return;
+        }
       }
 
-      if (message.toString() === "Audio File Started") {
-        index += 1;
-        const datetime = new Date().toLocaleString();
-        const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Started\n`;
-
-        !hasMainRecordingStarted
-            ? setupWriteStream.write(csvRow)
-            : writeStream.write(csvRow);
-
-        console.log("Audio File Started");
-        return;
-      }
-
-      if (message.toString() === "Audio File Ended") {
-        index += 1;
-        const datetime = new Date().toLocaleString();
-        const csvRow = `${index};${datetime};;;;;;;;;;;;;;Audio Recording Ended\n`;
-
-        !hasMainRecordingStarted
-            ? setupWriteStream.write(csvRow)
-            : writeStream.write(csvRow);
-
-        console.log("Audio File Ended");
-        return;
-      }
-
-      if (message.toString() === "Setup Finished") {
-        hasMainRecordingStarted = true;
+      // bc: Old plain-text control messages (still accepted, e.g. from cyton.js).
+      // bc: They have no frontend time, so the backend time is used like before.
+      if (handleControlMessage(message.toString(), Date.now())) {
         return;
       }
 
       let data;
       if (mode === "daisy") {
+        // bc: session.xxx instead of local variables in this whole block
         data = decodeDaisyData(message);
         if (data) {
           if (data.sampleNumber % 2 === 0) {
             // Combine with previous odd sample
             if (
-                previousData &&
-                previousData.sampleNumber === data.sampleNumber - 1
+                session.previousData &&
+                session.previousData.sampleNumber === data.sampleNumber - 1
             ) {
               const combinedData = {
-                ...previousData,
+                ...session.previousData,
                 ...data,
               };
-              index += 1;
+              session.index += 1;
               const datetime = new Date(combinedData.timestamp).toLocaleString();
-              const csvRow = `${index};${datetime};${combinedData.sampleNumber};${combinedData.timestamp};${combinedData.A1};${combinedData.A2};${combinedData.A3};${combinedData.A4};${combinedData.A5};${combinedData.A6};${combinedData.A7};${combinedData.A8};${combinedData.A9};${combinedData.A10};${combinedData.A11};${combinedData.A12};${combinedData.A13};${combinedData.A14};${combinedData.A15};${combinedData.A16};${combinedData.Accel0};${combinedData.Accel1};${combinedData.Accel2}\n`;
-              writeStream.write(csvRow);
-              previousData = null; // Reset for next pair
+              const csvRow = `${session.index};${datetime};${combinedData.sampleNumber};${combinedData.timestamp};${combinedData.A1};${combinedData.A2};${combinedData.A3};${combinedData.A4};${combinedData.A5};${combinedData.A6};${combinedData.A7};${combinedData.A8};${combinedData.A9};${combinedData.A10};${combinedData.A11};${combinedData.A12};${combinedData.A13};${combinedData.A14};${combinedData.A15};${combinedData.A16};${combinedData.Accel0};${combinedData.Accel1};${combinedData.Accel2}\n`;
+              session.writeStream.write(csvRow);
+              session.previousData = null; // Reset for next pair
             }
           } else {
             // Store odd sample data
-            previousData = data;
+            session.previousData = data;
           }
         }
       } else if (mode === "cyton") {
@@ -537,18 +604,18 @@ wss.on("connection", async (ws, req) => {
 
         // If paket valid -> write to CSV
         if (data) {
-          index += 1;
+          session.index += 1; // bc: session.xxx instead of local variables
           const datetime = new Date(frontendTimestamp).toLocaleString();
-          const csvRow = `${index};${datetime};${data.sampleNumber};${frontendTimestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+          const csvRow = `${session.index};${datetime};${data.sampleNumber};${frontendTimestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
 
-          hasMainRecordingStarted
-            ? writeStream.write(csvRow)
-            : setupWriteStream.write(csvRow);
+          session.hasMainRecordingStarted
+            ? session.writeStream.write(csvRow)
+            : session.setupWriteStream.write(csvRow);
         }
 
       } else {
         // Store odd sample data
-        previousData = data;
+        session.previousData = data; // bc: session.xxx instead of local variable
       }
     } catch (globalMsgError) {
       // catches unexpected critical errors
@@ -562,10 +629,28 @@ wss.on("connection", async (ws, req) => {
   });
 
   ws.on("close", () => {
-    writeStream.end();
-    setupWriteStream.end();
+    // bc: Only close the files if no other connection of this session is still open.
+    // bc: Otherwise the terminated old connection would close the files of the new one.
+    session.sockets.delete(ws);
+    if (session.sockets.size === 0 && activeSessions.get(sessionDir) === session) {
+      session.writeStream.end();
+      session.setupWriteStream.end();
+      activeSessions.delete(sessionDir);
+    }
     console.log(`WebSocket connection closed for participant: ${participant}`);
   });
+
+  // let the frontend know where this session's files live, so it can tell
+  // other services (e.g. the CSV-saving Express server) where to write to
+  // bc: Sent last, after all handlers are attached. The frontend waits for this message
+  // bc: before it sends data, so nothing arrives before the backend is ready.
+  ws.send(JSON.stringify({
+    event: "session_folder",
+    researcherId: researcher,
+    studyId: studyFolder,
+    participantId: participant,
+    startTime: startTime.toString(),
+  }));
 
   const decodeDaisyData = (message) => {
     const str = message.toString();

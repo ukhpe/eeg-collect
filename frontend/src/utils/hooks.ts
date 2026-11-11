@@ -40,6 +40,13 @@ const DEXIE_BATCH_SIZE = 50;
 let dexieBatchBuffer: EegData[] = [];
 let syncPromise: Promise<boolean> | null = null;
 
+// bc: Remembers whether "Setup Finished" was already sent to the backend in this session.
+// bc: Sent along when reconnecting, so the backend keeps writing to Recording.csv.
+let isSetupFinished = false;
+
+// bc: Delay between two reconnect attempts after the WebSocket connection was lost
+const RECONNECT_DELAY_MS = 2000;
+
 // Clears the Dexie db once per session, to avoid old data being sent to the backend
 const clearBrowserCache = async () => {
   dexieBatchBuffer = [];
@@ -107,18 +114,55 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
     return null;
   }
 
+  // bc: URL without resume parameters, used for the first connection and for reconnects
+  const baseUrl = `${URLs.WEB_SOCKET_URL}${mode}/${participantId.value}/?studyId=${studyId.value}`;
+
+  // bc: Opens a new WebSocket after the connection was lost and asks the backend to
+  // bc: continue the same session (same folder and files) instead of starting a new one.
+  // bc: Retries until it succeeds. The cached data is then sent by the watcher in useOpenBCIUtils.
+  let isReconnectScheduled = false;
+  const scheduleReconnect = () => {
+    if (isReconnectScheduled) return;
+    isReconnectScheduled = true;
+
+    setTimeout(async () => {
+      isReconnectScheduled = false;
+
+      const sessionFolder = store.state.sessionFolder;
+      const resumeParams = sessionFolder
+        ? `&resume=${encodeURIComponent(sessionFolder.startTime)}&setupFinished=${isSetupFinished ? 1 : 0}`
+        : "";
+
+      try {
+        console.log("bc: trying to reconnect WebSocket");
+        const newSocket = await createWebSocket(baseUrl + resumeParams);
+        store.commit("setWebSocket", { websocket: newSocket });
+        console.log("bc: WebSocket reconnected");
+      } catch (error) {
+        scheduleReconnect();
+      }
+    }, RECONNECT_DELAY_MS);
+  };
+
   const createWebSocket = (url: string): Promise<WebSocket> =>
     new Promise((resolve, reject) => {
       const socket = new WebSocket(url);
+      // bc: The connection counts as ready when the backend sent "session_folder",
+      // bc: because the backend only sends it after it is ready to receive data.
+      let isReady = false;
 
       socket.onopen = () => {
         console.log("WebSocket connection opened!");
-        resolve(socket);
       };
 
       socket.onerror = (error) => {
         console.error("WebSocket error:", error);
-        reject(error);
+        if (!isReady) reject(error); // bc: only relevant while connecting
+      };
+
+      // bc: Closed before it was ready (e.g. backend rejected it) -> attempt failed
+      socket.onclose = () => {
+        if (!isReady) reject(new Error("WebSocket closed before it was ready"));
       };
 
       socket.onmessage = (event) => {
@@ -138,6 +182,20 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
                 startTime: parsed.startTime,
               },
             });
+
+            // bc: Backend is ready -> hand out the socket (before: on open)
+            if (!isReady) {
+              isReady = true;
+
+              // bc: From now on a lost connection triggers a reconnect.
+              // bc: A failed attempt is handled by the catch in scheduleReconnect.
+              socket.onclose = () => {
+                console.log("bc: WebSocket connection lost");
+                scheduleReconnect();
+              };
+
+              resolve(socket);
+            }
           }
         } catch (error) {
           // Not a JSON control message (e.g. raw EEG data) — ignore
@@ -147,11 +205,10 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
 
   // A new connection starts a new session in the backend
   await clearBrowserCache();
+  isSetupFinished = false; // bc: new session, setup not finished yet
 
   console.log("A");
-  const ws = await createWebSocket(
-    `${URLs.WEB_SOCKET_URL}${mode}/${participantId.value}/?studyId=${studyId.value}`,
-  );
+  const ws = await createWebSocket(baseUrl); // bc: uses the shared baseUrl
 
   console.log("B");
 
@@ -338,17 +395,17 @@ export const useOpenBCIUtils = () => {
   };
 
   const startRecording = async () => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-      logToBackend("error", "WebSocket not open, chunk not sent.");
+    // bc: Only a session is required. The connection itself may be lost at the moment,
+    // bc: "Setup Finished" is cached and sent after the reconnect.
+    if (!ws.value) {
+      logToBackend("error", "No WebSocket session, recording not started.");
       return;
     }
 
-    // All setup data has to reach the backend before "Setup Finished",
-    // otherwise it would be written to Recording.csv
-    await flushCacheToBackend();
-
+    // bc: "Setup Finished" goes through the cache behind all setup data that was recorded
+    // bc: before it, so the backend switches to Recording.csv at the right point.
     console.log("Setup Finished");
-    ws.value.send("Setup Finished");
+    await queueControlMessage("Setup Finished");
     await commandBoardStartStreamingData(RecordingMode.SESSION_RECORDING);
 
     startSignalQualityCheck();
@@ -726,28 +783,38 @@ export const useOpenBCIUtils = () => {
     await exportImpedanceCSV();
   };
 
+  // bc: Audio markers are cached like the EEG data, so they are not lost on a connection loss
+  // bc: (before: sent directly, and dropped if the connection was not open)
   const sendAudioSignalStartMessage = async () => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-      logToBackend("error", "WebSocket not open, chunk not sent.");
-      return;
-    }
-
-    // Keep the marker in order with the cached EEG data
-    await flushCacheToBackend();
-    ws.value.send("Audio File Started");
+    await queueControlMessage("Audio File Started");
   };
 
   const sendAudioSignalEndMessage = async () => {
-    if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-      logToBackend("error", "WebSocket not open, chunk not sent.");
-      return;
-    }
-
-    await flushCacheToBackend();
-    ws.value.send("Audio File Ended");
+    await queueControlMessage("Audio File Ended");
   };
 
   // ---- METHODS: Internal ----
+
+  // bc: Puts a control message into the cache behind all chunks recorded before it,
+  // bc: together with the time it happened. Saved to Dexie right away (not after 50 chunks),
+  // bc: so it is not delayed and survives a connection loss.
+  const queueControlMessage = async (control: string) => {
+    dexieBatchBuffer.push({ timestamp: Date.now(), payload: [], control });
+
+    const batchToSave = dexieBatchBuffer;
+    dexieBatchBuffer = [];
+
+    try {
+      await db.eegData.bulkAdd(batchToSave);
+    } catch (error) {
+      logToBackend("error", `Error saving control message "${control}" to Dexie db:`, error);
+      return;
+    }
+
+    if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+      triggerSync();
+    }
+  };
 
   // saves a chunk to Dexie db if the batchbuffer is "full", and triggers sync if buffer is full
   const saveChunkToDexie = (chunk: Uint8Array | number[]) => {
@@ -784,6 +851,8 @@ export const useOpenBCIUtils = () => {
   const runSync = async (): Promise<boolean> => {
     try {
       while (ws.value && ws.value.readyState === WebSocket.OPEN) {
+        // bc: Use the same socket for the whole batch, even if the store gets a new one meanwhile
+        const socket = ws.value;
         const pendingItems = await db.eegData.limit(DEXIE_BATCH_SIZE).toArray();
 
         if (pendingItems.length === 0) break;
@@ -791,24 +860,42 @@ export const useOpenBCIUtils = () => {
         const idsToDelete: number[] = [];
 
         for (const item of pendingItems) {
+          // bc: Stop if the connection was lost during the batch. The items that were not
+          // bc: sent stay in Dexie and are sent after the reconnect.
+          // bc: (A closed WebSocket silently drops send() calls, so they must not be deleted.)
+          if (socket.readyState !== WebSocket.OPEN) break;
 
+          if (item.control) {
+            // bc: Cached control message -> sent as JSON with the time it happened in the frontend
+            socket.send(JSON.stringify({
+              event: "control",
+              message: item.control,
+              timestamp: item.timestamp,
+            }));
+
+            // bc: Only now the backend knows that the setup is finished.
+            // bc: Needed to resume the session correctly after a reconnect.
+            if (item.control === "Setup Finished") {
+              isSetupFinished = true;
+            }
+          } else {
+            // --- Timestamp und Payload kombinieren ---
+            const payloadBytes = new Uint8Array(item.payload);
+            const buffer = new ArrayBuffer(8 + payloadBytes.length);
+            const dataView = new DataView(buffer);
+
+            dataView.setFloat64(0, item.timestamp, true); // 8-Byte Timestamp (Little-Endian)
+
+            const combinedArray = new Uint8Array(buffer);
+            combinedArray.set(payloadBytes, 8); // Payload ab Offset 8 anhängen
+
+            socket.send(buffer);
+          } // bc: end of the EEG data case
+
+          // bc: Only delete items that were actually handed to an open connection
           if (item.id !== undefined) {
             idsToDelete.push(item.id);
           }
-
-          // --- Timestamp und Payload kombinieren ---
-          const payloadBytes = new Uint8Array(item.payload);
-          const buffer = new ArrayBuffer(8 + payloadBytes.length);
-          const dataView = new DataView(buffer);
-
-          dataView.setFloat64(0, item.timestamp, true); // 8-Byte Timestamp (Little-Endian)
-
-          const combinedArray = new Uint8Array(buffer);
-          combinedArray.set(payloadBytes, 8); // Payload ab Offset 8 anhängen
-
-          ws.value.send(buffer);
-
-
 
           //ws.value.send(new Uint8Array(item.payload));
         }
@@ -821,6 +908,14 @@ export const useOpenBCIUtils = () => {
       return false;
     }
   };
+
+  // bc: After a reconnect the store gets a new, open WebSocket.
+  // bc: Then send everything that was cached while the connection was lost.
+  watch(ws, (newSocket) => {
+    if (newSocket && newSocket.readyState === WebSocket.OPEN) {
+      triggerSync();
+    }
+  });
 
   // Writes the chunks that are still in memory to Dexie and sends everything
   // that was recorded up to now to the backend. Chunks recorded while flushing

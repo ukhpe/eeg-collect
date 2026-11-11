@@ -4,6 +4,9 @@ export interface EegData {
   id?: number;
   timestamp: number;
   payload: number[];
+  // bc: Set for control messages ("Setup Finished", "Audio File Started", "Audio File Ended"),
+  // bc: which are cached together with the EEG data. Not indexed, so no new db version is needed.
+  control?: string;
 }
 
 class EegDatabase extends Dexie {
