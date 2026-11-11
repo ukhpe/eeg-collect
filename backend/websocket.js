@@ -532,8 +532,6 @@ wss.on("connection", async (ws, req) => {
         // Take the 33-byte chunk from the raw buffer which are the eeg data bytes
         const singleChunk = rawBuffer.slice(8);
 
-        console.log(singleChunk);
-
         // decode the 33-byte chunk with old Cyton decoder
         data = decodeCytonData(singleChunk);
 
@@ -565,6 +563,7 @@ wss.on("connection", async (ws, req) => {
 
   ws.on("close", () => {
     writeStream.end();
+    setupWriteStream.end();
     console.log(`WebSocket connection closed for participant: ${participant}`);
   });
 

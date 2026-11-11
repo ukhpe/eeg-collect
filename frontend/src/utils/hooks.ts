@@ -30,6 +30,27 @@ import {
 } from "@/utils/openBCISerialTypes";
 import { filter_setup, filter_signal } from "@/utils/fir-filter";
 
+// ---- BROWSER CACHE ----
+// Shared by all useOpenBCIUtils() instances, so every component flushes and
+// syncs the same queue (otherwise two instances could send the same items twice).
+
+// Number of chunks collected in memory before they are written to Dexie,
+// to reduce the number of database writes and reads.
+const DEXIE_BATCH_SIZE = 50;
+let dexieBatchBuffer: EegData[] = [];
+let syncPromise: Promise<boolean> | null = null;
+
+// Clears the Dexie db once per session, to avoid old data being sent to the backend
+const clearBrowserCache = async () => {
+  dexieBatchBuffer = [];
+  try {
+    await db.eegData.clear();
+    console.log("Dexie-Databank successfully cleared on start.");
+  } catch (error) {
+    console.error("Error clearing the Dexie database: ", error);
+  }
+};
+
 export const useConfigureParticipantId = () => {
   const store = useStore();
   const UrlRoute = useRoute();
@@ -124,6 +145,9 @@ export const useWebsocketConnection = async (): Promise<WebSocket | null> => {
       };
     });
 
+  // A new connection starts a new session in the backend
+  await clearBrowserCache();
+
   console.log("A");
   const ws = await createWebSocket(
     `${URLs.WEB_SOCKET_URL}${mode}/${participantId.value}/?studyId=${studyId.value}`,
@@ -198,9 +222,6 @@ export const useOpenBCIUtils = () => {
 
   const impedanceRecordingStartTime = ref<string>("");
   const data = ref<OpenBCICytonData>(OPEN_BCI_CYTON_DATA_DEFAULT_VALUE);
-
-  // Buffer to accumulate data for batch insertion into Dexie
-  let dexieBatchBuffer: EegData[] = [];
 
   // Buffer storing complete cyton chunks.
   const rollingBuffer = ref<OpenBCISerialData[]>([]);
@@ -311,6 +332,9 @@ export const useOpenBCIUtils = () => {
     } catch (error) {
       logToBackend("error", "Error stopping recording:", error);
     }
+
+    // Send the last chunks that did not fill a whole batch
+    await flushCacheToBackend();
   };
 
   const startRecording = async () => {
@@ -318,6 +342,10 @@ export const useOpenBCIUtils = () => {
       logToBackend("error", "WebSocket not open, chunk not sent.");
       return;
     }
+
+    // All setup data has to reach the backend before "Setup Finished",
+    // otherwise it would be written to Recording.csv
+    await flushCacheToBackend();
 
     console.log("Setup Finished");
     ws.value.send("Setup Finished");
@@ -704,6 +732,8 @@ export const useOpenBCIUtils = () => {
       return;
     }
 
+    // Keep the marker in order with the cached EEG data
+    await flushCacheToBackend();
     ws.value.send("Audio File Started");
   };
 
@@ -713,20 +743,11 @@ export const useOpenBCIUtils = () => {
       return;
     }
 
+    await flushCacheToBackend();
     ws.value.send("Audio File Ended");
   };
 
   // ---- METHODS: Internal ----
-
-  // clears the Dexie db on start, to avoid old data being sent to backend
-  const clearEEGDataOnStart = async () => {
-    try {
-      await db.eegData.clear();
-      console.log("Dexie-Databank successfully cleared on start.");
-    } catch (error) {
-      console.error("Error clearing the Dexie database: ", error);
-    }
-  };
 
   // saves a chunk to Dexie db if the batchbuffer is "full", and triggers sync if buffer is full
   const saveChunkToDexie = (chunk: Uint8Array | number[]) => {
@@ -735,7 +756,7 @@ export const useOpenBCIUtils = () => {
       payload: Array.from(new Uint8Array(chunk)),
     });
 
-    if (dexieBatchBuffer.length >= 50) {
+    if (dexieBatchBuffer.length >= DEXIE_BATCH_SIZE) {
       const batchToSave = [...dexieBatchBuffer];
       dexieBatchBuffer = [];
 
@@ -749,17 +770,21 @@ export const useOpenBCIUtils = () => {
     }
   };
 
-  // synchronisation of Dexie db with backend
-  let isSyncRunning = false;
+  // synchronisation of Dexie db with backend. Only one sync runs at a time,
+  // a second call returns the running one. Resolves to false on an error.
+  const triggerSync = (): Promise<boolean> => {
+    if (!syncPromise) {
+      syncPromise = runSync().finally(() => {
+        syncPromise = null;
+      });
+    }
+    return syncPromise;
+  };
 
-  const triggerSync = async () => {
-    if (isSyncRunning || !ws.value || ws.value.readyState !== WebSocket.OPEN) return;
-
-    isSyncRunning = true;
-
+  const runSync = async (): Promise<boolean> => {
     try {
       while (ws.value && ws.value.readyState === WebSocket.OPEN) {
-        const pendingItems = await db.eegData.limit(50).toArray();
+        const pendingItems = await db.eegData.limit(DEXIE_BATCH_SIZE).toArray();
 
         if (pendingItems.length === 0) break;
 
@@ -770,8 +795,6 @@ export const useOpenBCIUtils = () => {
           if (item.id !== undefined) {
             idsToDelete.push(item.id);
           }
-
-          console.log(item.payload);
 
           // --- Timestamp und Payload kombinieren ---
           const payloadBytes = new Uint8Array(item.payload);
@@ -792,10 +815,41 @@ export const useOpenBCIUtils = () => {
 
         await db.eegData.bulkDelete(idsToDelete);
       }
+      return true;
     } catch (error) {
       logToBackend("error", "Error during Dexie db sync:", error);
-    } finally {
-      isSyncRunning = false;
+      return false;
+    }
+  };
+
+  // Writes the chunks that are still in memory to Dexie and sends everything
+  // that was recorded up to now to the backend. Chunks recorded while flushing
+  // are left to the normal batch sync.
+  const flushCacheToBackend = async () => {
+    if (dexieBatchBuffer.length > 0) {
+      const batchToSave = dexieBatchBuffer;
+      dexieBatchBuffer = [];
+      try {
+        await db.eegData.bulkAdd(batchToSave);
+      } catch (error) {
+        logToBackend("error", "Error saving batch to Dexie db:", error);
+      }
+    }
+
+    try {
+      const lastItem = await db.eegData.orderBy("id").last();
+      if (lastItem?.id === undefined) return;
+
+      while (
+        ws.value &&
+        ws.value.readyState === WebSocket.OPEN &&
+        (await db.eegData.where("id").belowOrEqual(lastItem.id).count()) > 0
+      ) {
+        const success = await triggerSync();
+        if (!success) break;
+      }
+    } catch (error) {
+      logToBackend("error", "Error while flushing the Dexie db:", error);
     }
   };
 
@@ -1063,7 +1117,6 @@ export const useOpenBCIUtils = () => {
         getEncodedCytonCommand(CytonBoardCommands.CONFIGURE_SAMPLING_RATE),
       );
       console.log("Recording started");
-      await clearEEGDataOnStart();
       writer.releaseLock();
       isRecording.value = true;
     } catch (error) {
