@@ -518,19 +518,36 @@ wss.on("connection", async (ws, req) => {
           }
         }
       } else if (mode === "cyton") {
-        data = decodeCytonData(message);
 
-        if (!data) {
-          return;
+        let rawBuffer;
+        if (Buffer.isBuffer(message)) {
+          rawBuffer = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+        } else {
+          rawBuffer = new Uint8Array(message);
         }
 
-        index += 1;
-        const datetime = new Date(data.timestamp).toLocaleString();
-        const csvRow = `${index};${datetime};${data.sampleNumber};${data.timestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+        const dataView = new DataView(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+        const frontendTimestamp = dataView.getFloat64(0, true); // true = Little-Endian wie im Frontend
 
-        hasMainRecordingStarted
+        // Take the 33-byte chunk from the raw buffer which are the eeg data bytes
+        const singleChunk = rawBuffer.slice(8);
+
+        console.log(singleChunk);
+
+        // decode the 33-byte chunk with old Cyton decoder
+        data = decodeCytonData(singleChunk);
+
+        // If paket valid -> write to CSV
+        if (data) {
+          index += 1;
+          const datetime = new Date(frontendTimestamp).toLocaleString();
+          const csvRow = `${index};${datetime};${data.sampleNumber};${frontendTimestamp};${data.A1};${data.A2};${data.A3};${data.A4};${data.A5};${data.A6};${data.A7};${data.A8};${data.Accel0};${data.Accel1};${data.Accel2}\n`;
+
+          hasMainRecordingStarted
             ? writeStream.write(csvRow)
             : setupWriteStream.write(csvRow);
+        }
+
       } else {
         // Store odd sample data
         previousData = data;
@@ -584,16 +601,13 @@ wss.on("connection", async (ws, req) => {
     return data;
   };
 
-  const decodeCytonData = (message) => {
-    const str = message.toString();
-    const numbers = str.split(",").map(Number);
-
-    const chunk = new Uint8Array(numbers);
+  const decodeCytonData = (chunk) => {
+    //small changes to fit with browser caching
     const byteArray = chunk.slice(1, -1);
     const sampleNumber = chunk[1];
     const data = {
       sampleNumber,
-      timestamp: new Date().getTime(),
+      //timestamp: new Date().getTime(),   //not used anymore because we get the time from frontend
       Accel0: interpret16bitAsInt32(chunk.slice(26, 28)) * 0.000125,
       Accel1: interpret16bitAsInt32(chunk.slice(28, 30)) * 0.000125,
       Accel2: interpret16bitAsInt32(chunk.slice(30, 32)) * 0.000125,

@@ -2,6 +2,7 @@ import { useRoute } from "vue-router";
 import { isEmpty, throttle } from "lodash";
 import { Store } from "vuex";
 
+import {db, EegData} from "@/utils/db";
 import { useStore } from "@/store";
 import {
   getEncodedCytonCommand,
@@ -198,6 +199,9 @@ export const useOpenBCIUtils = () => {
   const impedanceRecordingStartTime = ref<string>("");
   const data = ref<OpenBCICytonData>(OPEN_BCI_CYTON_DATA_DEFAULT_VALUE);
 
+  // Buffer to accumulate data for batch insertion into Dexie
+  let dexieBatchBuffer: EegData[] = [];
+
   // Buffer storing complete cyton chunks.
   const rollingBuffer = ref<OpenBCISerialData[]>([]);
 
@@ -324,7 +328,7 @@ export const useOpenBCIUtils = () => {
 
   const isWhileRunning = ref<boolean>(false);
 
-  // Wie readData() in cyton.js
+  // Like readData() in cyton.js
   const startSignalQualityCheck = async () => {
     isRecording.value = true;
 
@@ -402,6 +406,13 @@ export const useOpenBCIUtils = () => {
               continue;
             }
 
+            // catch incomplete chunks and reset
+            if (chunkBuffer.length != 33) {
+              chunkBuffer = []; // Reset buffer for the next chunk
+              headerFound = false;
+              continue;
+            }
+
             headerFound = false;
 
             if (
@@ -424,6 +435,8 @@ export const useOpenBCIUtils = () => {
 
                     // Use the throttled function to update rollingBuffer
                     throttledUpdateRollingBuffer(unthrottledBuffer);
+
+
                   }
                   break;
                 }
@@ -432,17 +445,8 @@ export const useOpenBCIUtils = () => {
                   break;
               }
 
-              if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-                logToBackend("error", "WebSocket not open, chunk not sent.");
-                break;
-              }
+              saveChunkToDexie([...chunkBuffer]);
 
-              try {
-                //@ts-ignore-next-line
-                ws.value.send(chunkBuffer);
-              } catch (err) {
-                logToBackend("error", "Error sending chunk to WebSocket:", err);
-              }
             } else if (
               specifiedRecordingMode === RecordingMode.IMPEDANCE ||
               recordingMode.value === RecordingMode.IMPEDANCE
@@ -468,17 +472,8 @@ export const useOpenBCIUtils = () => {
 
               switch (mode.value) {
                 case ConnectionMode.CYTON: {
-                  if (!ws.value || ws.value.readyState !== WebSocket.OPEN) {
-                    logToBackend("error", "WebSocket not open, chunk not sent.");
-                    break;
-                  }
 
-                  try {
-                    //@ts-ignore-next-line
-                    ws.value.send(chunkBuffer);
-                  } catch (err) {
-                    logToBackend("error", "Error sending chunk to WebSocket:", err);
-                  }
+                  saveChunkToDexie([...chunkBuffer]);
 
                   break;
                 }
@@ -722,6 +717,87 @@ export const useOpenBCIUtils = () => {
   };
 
   // ---- METHODS: Internal ----
+
+  // clears the Dexie db on start, to avoid old data being sent to backend
+  const clearEEGDataOnStart = async () => {
+    try {
+      await db.eegData.clear();
+      console.log("Dexie-Databank successfully cleared on start.");
+    } catch (error) {
+      console.error("Error clearing the Dexie database: ", error);
+    }
+  };
+
+  // saves a chunk to Dexie db if the batchbuffer is "full", and triggers sync if buffer is full
+  const saveChunkToDexie = (chunk: Uint8Array | number[]) => {
+    dexieBatchBuffer.push({
+      timestamp: Date.now(),
+      payload: Array.from(new Uint8Array(chunk)),
+    });
+
+    if (dexieBatchBuffer.length >= 50) {
+      const batchToSave = [...dexieBatchBuffer];
+      dexieBatchBuffer = [];
+
+      db.eegData.bulkAdd(batchToSave).then(() => {
+        if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+          triggerSync();
+        }
+      }).catch((error) => {
+        logToBackend("error", "Error saving batch to Dexie db:", error);
+      });
+    }
+  };
+
+  // synchronisation of Dexie db with backend
+  let isSyncRunning = false;
+
+  const triggerSync = async () => {
+    if (isSyncRunning || !ws.value || ws.value.readyState !== WebSocket.OPEN) return;
+
+    isSyncRunning = true;
+
+    try {
+      while (ws.value && ws.value.readyState === WebSocket.OPEN) {
+        const pendingItems = await db.eegData.limit(50).toArray();
+
+        if (pendingItems.length === 0) break;
+
+        const idsToDelete: number[] = [];
+
+        for (const item of pendingItems) {
+
+          if (item.id !== undefined) {
+            idsToDelete.push(item.id);
+          }
+
+          console.log(item.payload);
+
+          // --- Timestamp und Payload kombinieren ---
+          const payloadBytes = new Uint8Array(item.payload);
+          const buffer = new ArrayBuffer(8 + payloadBytes.length);
+          const dataView = new DataView(buffer);
+
+          dataView.setFloat64(0, item.timestamp, true); // 8-Byte Timestamp (Little-Endian)
+
+          const combinedArray = new Uint8Array(buffer);
+          combinedArray.set(payloadBytes, 8); // Payload ab Offset 8 anhängen
+
+          ws.value.send(buffer);
+
+
+
+          //ws.value.send(new Uint8Array(item.payload));
+        }
+
+        await db.eegData.bulkDelete(idsToDelete);
+      }
+    } catch (error) {
+      logToBackend("error", "Error during Dexie db sync:", error);
+    } finally {
+      isSyncRunning = false;
+    }
+  };
 
   const decodeChunkImpedance = (message: any[]) => {
     const str = message.toString();
@@ -987,6 +1063,7 @@ export const useOpenBCIUtils = () => {
         getEncodedCytonCommand(CytonBoardCommands.CONFIGURE_SAMPLING_RATE),
       );
       console.log("Recording started");
+      await clearEEGDataOnStart();
       writer.releaseLock();
       isRecording.value = true;
     } catch (error) {
