@@ -232,11 +232,7 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid login details." });
     }
 
-    console.log("Name:", username);
-    console.log("Input:", password, "DB-Hash:", user.passwordHash);
-
     const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-    console.log(isPasswordValid);
     if (!isPasswordValid) {
       return res.status(401).json({ message: "Invalid login details." });
     }
